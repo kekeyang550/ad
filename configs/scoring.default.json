@@ -1,0 +1,22 @@
+{
+  "name": "default",
+  "component_weights": {
+    "name_risk": 1.0,
+    "invalid_quote": 1.0,
+    "price_band": 1.0,
+    "intraday_momentum": 1.0,
+    "liquidity": 1.0,
+    "intraday_position": 1.0,
+    "gap_risk": 1.0,
+    "market_cap_tier": 1.0,
+    "turnover_quality": 1.0,
+    "board_risk": 1.0,
+    "board_quality": 1.0,
+    "trend_ma5": 1.0,
+    "momentum_5d": 1.0,
+    "trend_ma20": 1.0,
+    "momentum_20d": 1.0,
+    "volatility": 1.0
+  },
+  "disabled_components": []
+}
