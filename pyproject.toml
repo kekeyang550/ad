@@ -1,0 +1,12 @@
+[project]
+name = "ths-stock-picker"
+version = "0.1.0"
+description = "Read-only local TongHuaShun cache explorer and A-share stock scoring scaffold."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+ths-picker = "ths_stock_picker.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
