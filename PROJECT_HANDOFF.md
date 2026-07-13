@@ -28,7 +28,13 @@ GitHub 仓库：
 https://github.com/kekeyang550/ad
 ```
 
-注意：GitHub 首次同步已通过 GitHub API 完成；本机 `git push` 曾出现 GitHub 443 连接失败。后续如需同步，优先尝试普通 `git push`，若仍失败再考虑 GitHub API 或配置网络。
+GitHub 远端已与本机 `main` 完成同步。本机 Windows 代理使用 `127.0.0.1:7890`，Git 不会自动继承该设置；普通 `git push` 连接失败时，可只对当前命令使用：
+
+```powershell
+git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push origin main
+```
+
+该写法不会修改全局 Git 配置。若代理端口在其它电脑不同，请替换为实际端口或在可直连 GitHub 的网络执行普通 `git push`。
 
 ## 项目目标
 
