@@ -53,6 +53,27 @@ FACTOR_DEFINITIONS = [
         description="近 5 日涨幅过大或当日长上影放量，提示不宜盲目追高。",
         source="公式思路库：涨停后风险、长上影、放量滞涨类",
     ),
+    FactorDefinition(
+        factor_id="rps_60_strength",
+        name="RPS60 相对强势",
+        category="相对强弱",
+        description="近 60 个交易日涨幅在可比股票池中排名靠前，反映中期相对强度。",
+        source="RPS 相对强弱思路：阶段涨幅横截面排名，常用于趋势选股。",
+    ),
+    FactorDefinition(
+        factor_id="rps_120_strength",
+        name="RPS120 长期强势",
+        category="相对强弱",
+        description="近 120 个交易日涨幅在可比股票池中排名靠前，反映更长周期趋势强度。",
+        source="RPS 相对强弱思路：阶段涨幅横截面排名，常用于趋势选股。",
+    ),
+    FactorDefinition(
+        factor_id="rps_60_weakness",
+        name="RPS60 相对弱势",
+        category="风险",
+        description="近 60 个交易日涨幅在可比股票池中排名靠后，提示相对弱势风险。",
+        source="RPS 相对强弱思路：阶段涨幅横截面排名，常用于趋势过滤。",
+    ),
 ]
 
 

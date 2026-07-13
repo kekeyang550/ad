@@ -21,6 +21,8 @@ class AIDecision:
     summary: str
     strengths: list[str]
     risks: list[str]
+    trigger_conditions: list[str]
+    invalidation_conditions: list[str]
     next_actions: list[str]
     evidence: dict[str, Any]
 
@@ -45,6 +47,8 @@ def analyze_symbol(repo: Any, symbol: str) -> AIDecision | None:
     decision = _decision_label(row, components, rules, trend, note, news_signal)
     strengths = _strengths(row, components, rules, trend, note, news, factor_signals)
     risks = _risks(row, components, rules, trend, note, news, factor_signals)
+    trigger_conditions = _trigger_conditions(decision, row, trend)
+    invalidation_conditions = _invalidation_conditions(decision, row, trend)
     next_actions = _next_actions(decision, row, trend, risks, note)
     confidence = _confidence(row, components, trend, note, news)
     summary = _summary(row, decision, confidence, strengths, risks, trend, news)
@@ -58,6 +62,8 @@ def analyze_symbol(repo: Any, symbol: str) -> AIDecision | None:
         summary=summary,
         strengths=strengths,
         risks=risks,
+        trigger_conditions=trigger_conditions,
+        invalidation_conditions=invalidation_conditions,
         next_actions=next_actions,
         evidence={
             "score_date": row["score_date"],
@@ -252,6 +258,49 @@ def _next_actions(decision: str, row: Any, trend: dict[str, float | None], risks
     return actions[:4]
 
 
+def _trigger_conditions(decision: str, row: Any, trend: dict[str, float | None]) -> list[str]:
+    score = float(row["total_score"] or 0.0)
+    ma5 = trend.get("ma5")
+    ma20 = trend.get("ma20")
+    if decision == "回避":
+        return ["风险项消退且综合评分重新达到 55 分以上后，再重新生成结论。"]
+    if decision == "等待回踩":
+        levels = []
+        if ma5 is not None:
+            levels.append(f"MA5 {ma5:.2f}")
+        if ma20 is not None:
+            levels.append(f"MA20 {ma20:.2f}")
+        if levels:
+            return [f"回踩至{' 或 '.join(levels)}附近后，收盘重新站稳再复盘。"]
+        return ["等待至少 20 根有效日线后，确认回踩承接再复盘。"]
+    conditions: list[str] = []
+    if ma5 is not None and ma20 is not None:
+        conditions.append(f"收盘保持在 MA5 {ma5:.2f} 与 MA20 {ma20:.2f} 上方。")
+    elif ma20 is not None:
+        conditions.append(f"收盘保持在 MA20 {ma20:.2f} 上方。")
+    else:
+        conditions.append("补齐至少 20 根有效日线后，再确认趋势条件。")
+    if decision == "谨慎复盘":
+        conditions.append(f"综合评分从当前 {score:.2f} 提升至 55 分以上，再进入观察池。")
+    else:
+        conditions.append(f"综合评分保持在 55 分以上（当前 {score:.2f}）。")
+    return conditions[:2]
+
+
+def _invalidation_conditions(decision: str, row: Any, trend: dict[str, float | None]) -> list[str]:
+    score = float(row["total_score"] or 0.0)
+    ma20 = trend.get("ma20")
+    if decision == "回避":
+        return ["风险消息或本地回避状态解除，且综合评分达到 55 分以上时，当前回避结论失效。"]
+    conditions: list[str] = []
+    if ma20 is not None:
+        conditions.append(f"收盘跌破 MA20 {ma20:.2f} 后未能在后续交易日收复，当前观察结论失效。")
+    else:
+        conditions.append("后续补齐日线后若趋势未形成，当前观察结论失效。")
+    conditions.append(f"综合评分跌破 15 分（当前 {score:.2f}）或本地状态改为回避时，停止跟踪。")
+    return conditions[:2]
+
+
 def _confidence(row: Any, components: dict[str, float], trend: dict[str, float | None], note: Any, news: list[Any]) -> float:
     confidence = 45.0
     if row["latest_price"] is not None and row["pct_change"] is not None:
@@ -346,7 +395,7 @@ def _factor_quality_map(repo: Any) -> dict[str, dict[str, object]]:
     db_path = str(getattr(repo, "db_path", "default"))
     if db_path not in _FACTOR_QUALITY_CACHE:
         try:
-            rows = repo.factor_backtest_matrix(horizons=[5], limit_symbols=300)
+            rows = repo.factor_backtest_matrix(horizons=[5], limit_symbols=120, max_bars=180, use_cache=True)
         except Exception:
             rows = []
         _FACTOR_QUALITY_CACHE[db_path] = {str(row["factor_id"]): row for row in rows}

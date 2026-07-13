@@ -12,9 +12,10 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from .ai_decision import AIDecision, analyze_symbol, decisions_to_rows, rank_candidates
 from .factor_engine import factor_definitions
-from .storage import DEFAULT_DB_PATH, Repository
+from .storage import DEFAULT_DB_PATH, Repository, summarize_ai_decision_outcomes
 from .ths_local import DEFAULT_THS_ROOT
 from .ths_monitor import THSMonitorSnapshot, inspect_ths_source
+from .time_utils import display_shanghai_time
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,8 @@ def render_dashboard(repo: Repository, limit: int = 30, filters: DashboardFilter
     run_changes = repo.compare_score_runs(limit=12, min_score=1.0)
     snapshots = repo.latest_snapshots(limit=12)
     latest_run = repo.latest_score_runs(1)
+    quote_coverage = repo.latest_score_quote_coverage()
+    quote_health = repo.quote_health()
     profile_note = f" · 当前评分 {latest_run[0]['profile_name']}" if latest_run else ""
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -108,8 +111,13 @@ def render_dashboard(repo: Repository, limit: int = 30, filters: DashboardFilter
             "<h1>A 股选股面板</h1>",
             f"<p>生成时间 {html.escape(generated_at)}{html.escape(profile_note)} · 数据只读 · 不构成投资建议</p>",
             "</div>",
-            '<div class="actions"><a class="refresh" href="/">刷新</a><a class="refresh" href="/ths">同花顺</a><a class="refresh" href="/news">资讯</a><a class="refresh" href="/factors">因子</a><a class="refresh" href="/ai">AI 选股</a><a class="refresh" href="/notes">观察池</a></div>',
+            '<div class="actions"><a class="refresh" href="/">刷新</a><a class="refresh primary-action" href="/ai">AI 选股</a></div>',
             "</section>",
+            _render_app_nav("/"),
+            _render_daily_data_freshness_notice(repo),
+            _render_quote_freshness_notice(repo),
+            _render_ai_candidate_availability(quote_coverage, bool(candidates)),
+            _render_dashboard_guide(counts, quote_health, len(candidates), len(run_changes)),
             _render_counts(counts),
             _render_filters(active_filters),
             _render_candidates(candidates),
@@ -166,6 +174,7 @@ def render_notes_page(
         "本地观察池",
         [
             _topbar("本地观察池", "本项目本地保存的观察状态、标签和备注", back_link="/"),
+            _render_context_help("notes"),
             _render_notes_filter(active_filters),
             _render_notes_table(rows, active_filters),
         ],
@@ -203,10 +212,15 @@ def render_notes_csv(repo: Repository, limit: int = 1000, filters: NotesFilters 
 
 def render_ai_page(repo: Repository, limit: int = 20, min_score: float = 1.0) -> str:
     decisions = rank_candidates(repo, limit=limit, min_score=min_score)
+    quote_coverage = repo.latest_score_quote_coverage()
     return _page(
         "AI 选股",
         [
             _topbar("AI 选股", "基于评分、行情、日线和本地备注生成的结构化选股观点", back_link="/"),
+            _render_context_help("ai"),
+            _render_daily_data_freshness_notice(repo),
+            _render_quote_freshness_notice(repo),
+            _render_ai_candidate_availability(quote_coverage, bool(decisions)),
             _render_ai_controls(limit, min_score),
             _render_ai_decisions(decisions),
         ],
@@ -222,10 +236,109 @@ def render_factors_page(repo: Repository, limit: int = 50, horizon: int = 5) -> 
         "公式因子",
         [
             _topbar("公式因子", "借鉴公式思路，转成可解释因子并用真实日线回测", back_link="/"),
+            _render_context_help("factors"),
+            _render_daily_data_freshness_notice(repo),
             _render_factor_controls(limit, horizon),
             _render_factor_definitions(),
-            _render_factor_signals(repo.factor_scan(limit=limit)),
-            _render_factor_matrix(repo.factor_backtest_matrix(horizons=matrix_horizons, limit_symbols=300), matrix_horizons),
+            _render_factor_signals(repo.factor_scan(limit=limit, use_cache=True)),
+            _render_factor_matrix(
+                repo.factor_backtest_matrix(horizons=matrix_horizons, limit_symbols=30, max_bars=150, use_cache=True),
+                matrix_horizons,
+            ),
+        ],
+    )
+
+
+def render_factor_detail_page(repo: Repository, factor_id: str) -> str:
+    definition = next((item for item in factor_definitions() if item.factor_id == factor_id), None)
+    if definition is None:
+        return _page(
+            "因子不存在",
+            [
+                _topbar("因子不存在", "请求的因子定义不存在或已被移除", back_link="/factors"),
+                '<section class="panel"><p class="empty">未找到该因子。</p></section>',
+            ],
+        )
+    current_signals = [
+        row for row in repo.factor_scan(limit=50, use_cache=True) if row.get("factor_id") == factor_id
+    ]
+    matrix = next(
+        (
+            row
+            for row in repo.factor_backtest_matrix(
+                horizons=[3, 5, 10],
+                limit_symbols=30,
+                max_bars=150,
+                use_cache=True,
+            )
+            if row.get("factor_id") == factor_id
+        ),
+        None,
+    )
+    return _page(
+        f"因子详情：{definition.name}",
+        [
+            _topbar(definition.name, "因子逻辑、当前命中与历史表现", back_link="/factors"),
+            _render_daily_data_freshness_notice(repo),
+            _render_factor_detail_summary(definition, current_signals, matrix),
+            _render_factor_detail_signals(current_signals),
+            _render_factor_detail_history(matrix),
+        ],
+    )
+
+
+def render_backtest_page(
+    repo: Repository,
+    horizon: int = 5,
+    top_n: int = 10,
+    min_signal_score: float = 60.0,
+    limit_symbols: int = 300,
+    cost_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+    benchmark_symbol: str = "",
+    max_bars: int = 260,
+    execution_mode: str = "next_open",
+    position_mode: str = "non_overlapping",
+) -> str:
+    selected_max_bars = None if max_bars <= 0 else max_bars
+    selected_execution_mode = execution_mode if execution_mode in {"next_open", "signal_close"} else "next_open"
+    selected_position_mode = position_mode if position_mode in {"non_overlapping", "daily_batches"} else "non_overlapping"
+    result = repo.strategy_backtest(
+        horizon_days=horizon,
+        top_n=top_n,
+        min_signal_score=min_signal_score,
+        limit_symbols=limit_symbols,
+        cost_bps=cost_bps,
+        slippage_bps=slippage_bps,
+        benchmark_symbol=benchmark_symbol,
+        max_bars=selected_max_bars,
+        execution_mode=selected_execution_mode,
+        position_mode=selected_position_mode,
+    )
+    return _page(
+        "策略回测",
+        [
+            _topbar("策略回测", "用真实日线按当日因子信号选股，并统计未来持有收益", back_link="/"),
+            _render_context_help("backtest"),
+            _render_daily_data_freshness_notice(repo),
+            _render_backtest_controls(
+                horizon,
+                selected_execution_mode,
+                selected_position_mode,
+                top_n,
+                min_signal_score,
+                limit_symbols,
+                cost_bps,
+                slippage_bps,
+                benchmark_symbol,
+                max_bars,
+            ),
+            _render_backtest_summary(result),
+            _render_backtest_equity_chart(result),
+            _render_backtest_trades(result),
+            _render_backtest_daily_returns(result),
+            _render_backtest_period_stats(result, "yearly", "年度批次表现"),
+            _render_backtest_period_stats(result, "monthly", "月度批次表现"),
         ],
     )
 
@@ -255,15 +368,153 @@ def render_ai_changes_page(repo: Repository, limit: int = 50) -> str:
     )
 
 
+def render_ai_outcomes_page(
+    repo: Repository,
+    limit: int = 50,
+    horizon: int = 5,
+    symbol: str = "",
+) -> str:
+    selected_symbol = symbol if len(symbol) == 6 and symbol.isdigit() else ""
+    selected_horizon = max(1, min(horizon, 60))
+    rows = repo.ai_decision_outcomes(
+        limit=limit,
+        horizon_days=selected_horizon,
+        symbol=selected_symbol or None,
+    )
+    summary = summarize_ai_decision_outcomes(rows)
+    return _page(
+        "AI 观点复盘",
+        [
+            _topbar("AI 观点复盘", "按保存时评分日期，观察后续日线表现", back_link="/ai/history"),
+            _render_context_help("ai_outcomes"),
+            _render_daily_data_freshness_notice(repo),
+            _render_ai_outcome_controls(limit, selected_horizon, selected_symbol),
+            _render_ai_outcome_summary(summary),
+            _render_ai_outcomes(rows),
+        ],
+    )
+
+
 def render_ths_monitor_page(ths_root: Path = DEFAULT_THS_ROOT) -> str:
     snapshot = inspect_ths_source(ths_root)
     return _page(
         "同花顺数据源",
         [
             _topbar("同花顺数据源", "只读监控同花顺进程和本地实时缓存状态", back_link="/"),
+            _render_context_help("ths"),
             _render_ths_summary(snapshot),
             _render_ths_processes(snapshot),
             _render_ths_files(snapshot),
+        ],
+    )
+
+
+def render_data_health_page(repo: Repository) -> str:
+    health = repo.daily_bar_health()
+    return _page(
+        "日线数据健康",
+        [
+            _topbar("日线数据健康", "检查历史日线来源、覆盖范围和同日来源冲突", back_link="/"),
+            _render_data_health_summary(health),
+            _render_data_health_sources(health),
+        ],
+    )
+
+
+def render_strategy_validation_page(repo: Repository, limit: int = 30) -> str:
+    rows = repo.strategy_validation_runs(limit=limit)
+    return _page(
+        "策略样本外验证",
+        [
+            _topbar("策略样本外验证", "已保存的滚动样本外结论与可复核运行参数", back_link="/backtest"),
+            _render_context_help("validation"),
+            _render_strategy_validation_runs(rows),
+        ],
+    )
+
+
+def render_strategy_backtest_runs_page(
+    repo: Repository,
+    limit: int = 30,
+    saved_run_id: int = 0,
+) -> str:
+    rows = repo.strategy_backtest_runs(limit=limit)
+    saved_notice = ""
+    if saved_run_id > 0:
+        saved_notice = f'<section class="panel"><p>已保存策略回测记录 #{saved_run_id}。</p></section>'
+    return _page(
+        "已保存策略回测",
+        [
+            _topbar("已保存策略回测", "保存参数、结果摘要和日线版本，便于后续复核", back_link="/backtest"),
+            _render_context_help("backtest_runs"),
+            saved_notice,
+            _render_strategy_backtest_runs(rows),
+        ],
+    )
+
+
+def render_strategy_backtest_run_detail_page(repo: Repository, run_id: int) -> str:
+    row = repo.strategy_backtest_run(run_id)
+    if row is None:
+        return _page(
+            "策略回测记录不存在",
+            [
+                _topbar("策略回测记录不存在", "请求的保存记录不存在或已被删除", back_link="/strategy-backtest-runs"),
+                '<section class="panel"><p class="empty">未找到该策略回测记录。</p></section>',
+            ],
+        )
+    try:
+        result = json.loads(str(row["result_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        result = {}
+    if not isinstance(result, dict):
+        result = {}
+    if not result:
+        return _page(
+            "策略回测记录",
+            [
+                _topbar("策略回测记录", "保存结果无法读取", back_link="/strategy-backtest-runs"),
+                '<section class="panel"><p class="empty">此记录的完整结果不可用。</p></section>',
+            ],
+        )
+    try:
+        parameters = json.loads(str(row["parameters_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        parameters = {}
+    if not isinstance(parameters, dict):
+        parameters = {}
+    parameter_text = (
+        f"持有 {parameters.get('horizon_days', '-')} 日，Top {parameters.get('top_n', '-')}，"
+        f"最低信号分 {parameters.get('min_signal_score', '-')}，{parameters.get('execution_mode', '-')} / "
+        f"{parameters.get('position_mode', '-')}"
+    )
+    return _page(
+        f"策略回测记录 #{row['id']}",
+        [
+            _topbar(
+                f"策略回测记录 #{row['id']}",
+                f"保存于 {display_shanghai_time(row['run_at'])} · 日线版本 {row['data_fingerprint']}",
+                back_link="/strategy-backtest-runs",
+            ),
+            f'<section class="panel"><p>{_e(parameter_text)}</p></section>',
+            _render_backtest_summary(result),
+            _render_backtest_equity_chart(result),
+            _render_backtest_trades(result),
+            _render_backtest_daily_returns(result),
+            _render_backtest_period_stats(result, "yearly", "年度批次表现"),
+            _render_backtest_period_stats(result, "monthly", "月度批次表现"),
+        ],
+    )
+
+
+def render_daily_runs_page(repo: Repository, limit: int = 30) -> str:
+    rows = repo.daily_runs(limit=limit)
+    return _page(
+        "每日运行记录",
+        [
+            _topbar("每日运行记录", "数据更新、评分和导出流水线的本地执行记录", back_link="/"),
+            _render_context_help("daily_runs"),
+            _render_daily_runs(rows),
         ],
     )
 
@@ -274,6 +525,7 @@ def render_news_page(repo: Repository, query: str = "", tag: str = "", limit: in
         "资讯",
         [
             _topbar("资讯", "同花顺本地资讯缓存解析结果", back_link="/"),
+            _render_context_help("news"),
             _render_news_filters(query, tag, limit),
             _render_news_table(rows),
         ],
@@ -374,6 +626,62 @@ def serve_dashboard(
                 page = render_ths_monitor_page(ths_root)
                 self._write_text(page, "text/html; charset=utf-8")
                 return
+            if parsed.path == "/data-health":
+                repo = Repository(db_path)
+                try:
+                    repo.init_schema()
+                    page = render_data_health_page(repo)
+                finally:
+                    repo.close()
+                self._write_text(page, "text/html; charset=utf-8")
+                return
+            if parsed.path == "/strategy-validation":
+                query = parse_qs(parsed.query)
+                page_limit = int(_to_float(_first(query, "limit"), 30.0))
+                repo = Repository(db_path)
+                try:
+                    repo.init_schema()
+                    page = render_strategy_validation_page(repo, limit=page_limit)
+                finally:
+                    repo.close()
+                self._write_text(page, "text/html; charset=utf-8")
+                return
+            if parsed.path == "/strategy-backtest-runs":
+                query = parse_qs(parsed.query)
+                page_limit = int(_to_float(_first(query, "limit"), 30.0))
+                saved_run_id = int(_to_float(_first(query, "saved"), 0.0))
+                repo = Repository(db_path)
+                try:
+                    repo.init_schema()
+                    page = render_strategy_backtest_runs_page(repo, limit=page_limit, saved_run_id=saved_run_id)
+                finally:
+                    repo.close()
+                self._write_text(page, "text/html; charset=utf-8")
+                return
+            if parsed.path.startswith("/strategy-backtest-runs/"):
+                run_id_text = parsed.path.rsplit("/", 1)[-1]
+                if not run_id_text.isdigit():
+                    self.send_error(404)
+                    return
+                repo = Repository(db_path)
+                try:
+                    repo.init_schema()
+                    page = render_strategy_backtest_run_detail_page(repo, int(run_id_text))
+                finally:
+                    repo.close()
+                self._write_text(page, "text/html; charset=utf-8")
+                return
+            if parsed.path == "/daily-runs":
+                query = parse_qs(parsed.query)
+                page_limit = int(_to_float(_first(query, "limit"), 30.0))
+                repo = Repository(db_path)
+                try:
+                    repo.init_schema()
+                    page = render_daily_runs_page(repo, limit=page_limit)
+                finally:
+                    repo.close()
+                self._write_text(page, "text/html; charset=utf-8")
+                return
             if parsed.path == "/news":
                 query = parse_qs(parsed.query)
                 q = (_first(query, "q") or "").strip()
@@ -395,6 +703,51 @@ def serve_dashboard(
                 try:
                     repo.init_schema()
                     page = render_factors_page(repo, limit=page_limit, horizon=horizon)
+                finally:
+                    repo.close()
+                self._write_text(page, "text/html; charset=utf-8")
+                return
+            if parsed.path.startswith("/factors/"):
+                factor_id = parsed.path.rsplit("/", 1)[-1]
+                if factor_id not in {item.factor_id for item in factor_definitions()}:
+                    self.send_error(404)
+                    return
+                repo = Repository(db_path)
+                try:
+                    repo.init_schema()
+                    page = render_factor_detail_page(repo, factor_id)
+                finally:
+                    repo.close()
+                self._write_text(page, "text/html; charset=utf-8")
+                return
+            if parsed.path == "/backtest":
+                query = parse_qs(parsed.query)
+                horizon = int(_to_float(_first(query, "horizon"), 5.0))
+                top_n = int(_to_float(_first(query, "top_n"), 10.0))
+                min_signal_score = _to_float(_first(query, "min_signal_score"), 60.0)
+                limit_symbols = int(_to_float(_first(query, "limit_symbols"), 300.0))
+                cost_bps = _to_float(_first(query, "cost_bps"), 0.0)
+                slippage_bps = _to_float(_first(query, "slippage_bps"), 0.0)
+                benchmark_symbol = _first(query, "benchmark_symbol")
+                max_bars = int(_to_float(_first(query, "max_bars"), 260.0))
+                execution_mode = _first(query, "execution") or "next_open"
+                position_mode = _first(query, "position_mode") or "non_overlapping"
+                repo = Repository(db_path)
+                try:
+                    repo.init_schema()
+                    page = render_backtest_page(
+                        repo,
+                        horizon=horizon,
+                        top_n=top_n,
+                        min_signal_score=min_signal_score,
+                        limit_symbols=limit_symbols,
+                        cost_bps=cost_bps,
+                        slippage_bps=slippage_bps,
+                        benchmark_symbol=benchmark_symbol,
+                        max_bars=max_bars,
+                        execution_mode=execution_mode,
+                        position_mode=position_mode,
+                    )
                 finally:
                     repo.close()
                 self._write_text(page, "text/html; charset=utf-8")
@@ -430,6 +783,24 @@ def serve_dashboard(
                 try:
                     repo.init_schema()
                     page = render_ai_changes_page(repo, limit=page_limit)
+                finally:
+                    repo.close()
+                self._write_text(page, "text/html; charset=utf-8")
+                return
+            if parsed.path == "/ai/outcomes":
+                query = parse_qs(parsed.query)
+                page_limit = int(_to_float(_first(query, "limit"), 50.0))
+                horizon = int(_to_float(_first(query, "horizon"), 5.0))
+                symbol = (_first(query, "symbol") or "").strip()
+                repo = Repository(db_path)
+                try:
+                    repo.init_schema()
+                    page = render_ai_outcomes_page(
+                        repo,
+                        limit=page_limit,
+                        horizon=horizon,
+                        symbol=symbol,
+                    )
                 finally:
                     repo.close()
                 self._write_text(page, "text/html; charset=utf-8")
@@ -494,6 +865,30 @@ def serve_dashboard(
                 self.send_header("Location", _safe_local_redirect(return_to, "/notes"))
                 self.end_headers()
                 return
+            if parsed.path == "/notes/quick-add":
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                payload = self.rfile.read(length).decode("utf-8")
+                form = parse_qs(payload)
+                symbol = (_first(form, "symbol") or "").strip()
+                status = (_first(form, "status") or "watch").strip()
+                tags = (_first(form, "tags") or "AI候选").strip()
+                note = (_first(form, "note") or "").strip()
+                return_to = (_first(form, "return_to") or "/notes").strip()
+                if status not in {"watch", "hold", "avoid", "review"}:
+                    status = "watch"
+                if not (len(symbol) == 6 and symbol.isdigit()):
+                    self.send_error(400)
+                    return
+                repo = Repository(db_path)
+                try:
+                    repo.init_schema()
+                    repo.upsert_stock_note(symbol, status=status, tags=tags, note=note)
+                finally:
+                    repo.close()
+                self.send_response(303)
+                self.send_header("Location", _safe_local_redirect(return_to, "/notes"))
+                self.end_headers()
+                return
             if parsed.path == "/ai/save":
                 length = int(self.headers.get("Content-Length", "0") or "0")
                 payload = self.rfile.read(length).decode("utf-8")
@@ -509,6 +904,55 @@ def serve_dashboard(
                     repo.close()
                 self.send_response(303)
                 self.send_header("Location", f"/ai/history?limit={page_limit}")
+                self.end_headers()
+                return
+            if parsed.path == "/backtest/save":
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                payload = self.rfile.read(length).decode("utf-8")
+                form = parse_qs(payload)
+                horizon = int(_to_float(_first(form, "horizon"), 5.0))
+                top_n = int(_to_float(_first(form, "top_n"), 10.0))
+                min_signal_score = _to_float(_first(form, "min_signal_score"), 60.0)
+                limit_symbols = int(_to_float(_first(form, "limit_symbols"), 300.0))
+                cost_bps = _to_float(_first(form, "cost_bps"), 0.0)
+                slippage_bps = _to_float(_first(form, "slippage_bps"), 0.0)
+                benchmark_symbol = (_first(form, "benchmark_symbol") or "").strip()
+                max_bars = int(_to_float(_first(form, "max_bars"), 260.0))
+                execution_mode = _first(form, "execution") or "next_open"
+                position_mode = _first(form, "position_mode") or "non_overlapping"
+                selected_max_bars = None if max_bars <= 0 else max_bars
+                parameters: dict[str, object] = {
+                    "horizon_days": horizon,
+                    "top_n": top_n,
+                    "min_signal_score": min_signal_score,
+                    "limit_symbols": limit_symbols,
+                    "cost_bps": cost_bps,
+                    "slippage_bps": slippage_bps,
+                    "benchmark_symbol": benchmark_symbol or None,
+                    "max_bars": selected_max_bars,
+                    "execution_mode": execution_mode,
+                    "position_mode": position_mode,
+                }
+                repo = Repository(db_path)
+                try:
+                    repo.init_schema()
+                    result = repo.strategy_backtest(
+                        horizon_days=horizon,
+                        top_n=top_n,
+                        min_signal_score=min_signal_score,
+                        limit_symbols=limit_symbols,
+                        cost_bps=cost_bps,
+                        slippage_bps=slippage_bps,
+                        benchmark_symbol=benchmark_symbol or None,
+                        max_bars=selected_max_bars,
+                        execution_mode=execution_mode,
+                        position_mode=position_mode,
+                    )
+                    run_id = repo.save_strategy_backtest_run(parameters, result)
+                finally:
+                    repo.close()
+                self.send_response(303)
+                self.send_header("Location", f"/strategy-backtest-runs?saved={run_id}")
                 self.end_headers()
                 return
             self.send_error(404)
@@ -550,6 +994,232 @@ def _render_counts(counts: dict[str, int]) -> str:
             "</article>"
         )
     return '<section class="metrics">' + "".join(cards) + "</section>"
+
+
+def _render_dashboard_guide(
+    counts: dict[str, int],
+    quote_health: dict[str, object],
+    candidate_count: int,
+    change_count: int,
+) -> str:
+    has_daily_bars = counts.get("daily_bars", 0) > 0
+    has_priced_quotes = int(quote_health.get("priced_symbols") or 0) > 0
+    if has_daily_bars and has_priced_quotes:
+        status_text, status_class = "数据已接入", "ok"
+    elif has_daily_bars:
+        status_text, status_class = "行情待补齐", "warn"
+    elif has_priced_quotes:
+        status_text, status_class = "日线待补齐", "warn"
+    else:
+        status_text, status_class = "等待数据", "warn"
+    steps = [
+        ("1", "数据更新", "确认同花顺缓存、行情、日线和新闻是否可用", "/ths"),
+        ("2", "AI 选股", "查看当前候选、结论、正向证据和风险点", "/ai"),
+        ("3", "因子验证", "检查公式思路是否真的有历史表现", "/factors"),
+        ("4", "策略回测", "按信号分选股并统计未来持有收益", "/backtest"),
+        ("5", "观察复盘", "把要跟踪的股票加入观察池并记录原因", "/notes"),
+    ]
+    rendered_steps = []
+    for number, title, text, href in steps:
+        rendered_steps.append(
+            f'<a class="workflow-step" href="{_e(href)}">'
+            f'<span class="step-index">{_e(number)}</span>'
+            "<strong>" + _e(title) + "</strong>"
+            "<small>" + _e(text) + "</small>"
+            "</a>"
+        )
+    return (
+        '<section class="hero-panel">'
+        '<div class="hero-copy">'
+        '<span class="eyebrow">A 股 AI 选股工作台</span>'
+        "<h2>从真实数据出发，先筛选，再验证，最后复盘。</h2>"
+        "<p>当前面板把同花顺本地数据、公开行情、公式型因子、新闻消息和策略回测放在同一条决策链里。</p>"
+        '<div class="hero-actions">'
+        '<a class="refresh primary-action" href="/ai">查看 AI 选股</a>'
+        '<a class="refresh" href="/backtest">运行策略回测</a>'
+        '<a class="refresh" href="/factors">验证因子</a>'
+        "</div>"
+        "</div>"
+        '<div class="hero-status">'
+        f'<span class="pill {status_class}">{_e(status_text)}</span>'
+        f"<strong>{candidate_count}</strong><small>当前候选</small>"
+        f"<strong>{change_count}</strong><small>批次变化</small>"
+        "</div>"
+        "</section>"
+        '<section class="workflow">' + "".join(rendered_steps) + "</section>"
+    )
+
+
+def _render_context_help(kind: str) -> str:
+    copy = {
+        "ai": (
+            "看什么",
+            "优先看“结论、置信度、公式因子、摘要”。点代码进入详情页，核对趋势、新闻、因子历史结论和本地备注。",
+            [("保存榜单", "/ai/history"), ("看策略回测", "/backtest"), ("看因子", "/factors")],
+        ),
+        "ai_outcomes": (
+            "如何复盘",
+            "评分日之后以首个有效交易日开盘作为观察起点，第 N 个后续交易日收盘计算收益。同一代码同一评分日只保留最新保存版本，日线未更新或观察期未满时只显示待观察。",
+            [("历史观点", "/ai/history"), ("观点变化", "/ai/changes"), ("日线健康", "/data-health")],
+        ),
+        "factors": (
+            "怎么用",
+            "公式只作为因子灵感。先看当前命中，再看多周期回测矩阵；历史结论为反向的因子不应盲目加分。",
+            [("策略回测", "/backtest"), ("AI 选股", "/ai"), ("资讯", "/news")],
+        ),
+        "backtest": (
+            "怎么回测",
+            "设置持有天数、每日入选数量和最低信号分。回测只用当日以前数据选股，未来收益仅用于统计。",
+            [("查看因子矩阵", "/factors"), ("样本外验证", "/strategy-validation"), ("已保存回测", "/strategy-backtest-runs")],
+        ),
+        "backtest_runs": (
+            "如何复核",
+            "每条记录固定保存回测参数、日线版本指纹和结果摘要。日线更新后版本会变化，旧结果不应当作新数据上的结论。",
+            [("运行回测", "/backtest"), ("样本外验证", "/strategy-validation"), ("日线健康", "/data-health")],
+        ),
+        "validation": (
+            "如何解读",
+            "每次记录都在独立测试窗口评估策略。未通过会否定当前假设；基准缺失或覆盖不完整时，结论最多为观察。",
+            [("策略回测", "/backtest"), ("因子验证", "/factors"), ("日线健康", "/data-health")],
+        ),
+        "daily_runs": (
+            "运行记录",
+            "每天更新后先确认状态，再查看日线导入量和输出文件。失败记录会保留停止的步骤与错误信息，便于定位数据源或网络问题。",
+            [("数据源", "/ths"), ("日线健康", "/data-health"), ("AI 选股", "/ai")],
+        ),
+        "notes": (
+            "怎么复盘",
+            "观察池保存你的人工判断。把 AI 候选、回测表现和新闻催化写成标签或备注，后续对比观点变化。",
+            [("AI 选股", "/ai"), ("历史观点", "/ai/history"), ("策略回测", "/backtest")],
+        ),
+        "ths": (
+            "数据源",
+            "这里确认同花顺是否正在运行、A 股实时缓存是否活跃。只读监控，不接交易、不读取账号敏感文件。",
+            [("资讯", "/news"), ("首页", "/"), ("AI 选股", "/ai")],
+        ),
+        "news": (
+            "消息面",
+            "这里查看同花顺本地资讯缓存和主题标签。AI 会把个股相关新闻或行业主题新闻作为辅助证据。",
+            [("AI 选股", "/ai"), ("因子", "/factors"), ("观察池", "/notes")],
+        ),
+    }.get(kind)
+    if copy is None:
+        return ""
+    title, text, actions = copy
+    links = "".join(f'<a class="ghost" href="{_e(href)}">{_e(label)}</a>' for label, href in actions)
+    return (
+        '<section class="guide-panel">'
+        "<div>"
+        f"<h2>{_e(title)}</h2>"
+        f"<p>{_e(text)}</p>"
+        "</div>"
+        f'<div class="guide-actions">{links}</div>'
+        "</section>"
+    )
+
+
+def _render_ai_candidate_availability(coverage: dict[str, object], has_candidates: bool) -> str:
+    score_count = int(coverage.get("score_count") or 0)
+    priced_score_count = int(coverage.get("priced_score_count") or 0)
+    if has_candidates or score_count == 0 or priced_score_count > 0:
+        return ""
+    score_date = _e(coverage.get("score_date") or "-")
+    return (
+        '<section class="data-freshness-warning">'
+        "<div>"
+        "<h2>AI 候选暂不可用</h2>"
+        f"<p>最新评分批次 {score_date} 有 {score_count} 个评分，带价格行情 {priced_score_count} / {score_count}。"
+        "缺少可用价格行情时不会生成候选，以免基于空行情给出结论。</p>"
+        "</div>"
+        '<a class="ghost" href="/daily-runs">查看每日记录</a>'
+        "</section>"
+    )
+
+
+def _render_daily_data_freshness_notice(repo: Repository) -> str:
+    freshness = repo.daily_bar_freshness()
+    if freshness.get("freshness_status") != "lagging":
+        return ""
+    latest_trade_date = _e(freshness.get("latest_trade_date") or "-")
+    weekday_lag_days = int(freshness.get("weekday_lag_days") or 0)
+    return (
+        '<section class="data-freshness-warning">'
+        "<div>"
+        "<h2>日线时效提醒</h2>"
+        f"<p>最近股票日线为 {latest_trade_date}，按工作日粗略估算可能滞后 {weekday_lag_days} 个工作日。"
+        "当前研究结果基于这批日线，请更新后再作判断。</p>"
+        "</div>"
+        '<a class="ghost" href="/data-health">查看日线健康</a>'
+        "</section>"
+    )
+
+
+def _render_quote_freshness_notice(repo: Repository) -> str:
+    freshness = repo.quote_health()
+    freshness_status = freshness.get("freshness_status")
+    if freshness_status not in {"lagging", "partial"}:
+        return ""
+    latest_price_date = _e(freshness.get("latest_price_date") or "-")
+    weekday_lag_days = int(freshness.get("weekday_lag_days") or 0)
+    priced_symbols = int(freshness.get("priced_symbols") or 0)
+    current_symbols = int(freshness.get("current_priced_symbols") or 0)
+    stale_symbols = int(freshness.get("stale_priced_symbols") or 0)
+    if freshness_status == "partial":
+        detail = f"带价格行情共 {priced_symbols} 只，其中 {current_symbols} 只近 1 个工作日已刷新，{stale_symbols} 只可能过期。"
+    else:
+        detail = f"最近带价格行情为 {latest_price_date}，覆盖 {priced_symbols} 只股票，按工作日粗略估算可能滞后 {weekday_lag_days} 个工作日。"
+    return (
+        '<section class="data-freshness-warning">'
+        "<div>"
+        "<h2>行情时效提醒</h2>"
+        f"<p>{detail}"
+        "保留报价可防止网络短暂失败清空候选，但应更新后再作判断。</p>"
+        "</div>"
+        '<a class="ghost" href="/daily-runs">查看每日记录</a>'
+        "</section>"
+    )
+
+
+def _render_app_nav(active: str) -> str:
+    items = [
+        ("/", "总览"),
+        ("/daily-runs", "每日记录"),
+        ("/ai", "AI 选股"),
+        ("/backtest", "策略回测"),
+        ("/strategy-validation", "样本外验证"),
+        ("/factors", "因子验证"),
+        ("/news", "资讯"),
+        ("/notes", "观察池"),
+        ("/ths", "数据源"),
+        ("/data-health", "日线健康"),
+    ]
+    links = []
+    for href, label in items:
+        current = " active" if href == active else ""
+        links.append(f'<a class="nav-link{current}" href="{_e(href)}">{_e(label)}</a>')
+    return '<nav class="app-nav">' + "".join(links) + "</nav>"
+
+
+def _active_path_for_title(title: str) -> str:
+    if title.startswith("AI"):
+        return "/ai"
+    if "每日运行记录" in title:
+        return "/daily-runs"
+    if "样本外验证" in title:
+        return "/strategy-validation"
+    if "回测" in title:
+        return "/backtest"
+    if "因子" in title:
+        return "/factors"
+    if "资讯" in title:
+        return "/news"
+    if "观察" in title:
+        return "/notes"
+    if "同花顺" in title:
+        return "/ths"
+    if "日线数据健康" in title:
+        return "/data-health"
+    return "/"
 
 
 def _filter_candidate_rows(rows: list[object], filters: DashboardFilters) -> list[object]:
@@ -757,6 +1427,252 @@ def _render_ths_summary(snapshot: THSMonitorSnapshot) -> str:
     return '<section class="metrics ths-metrics">' + "".join(rendered) + "</section>"
 
 
+def _render_data_health_summary(health: dict[str, object]) -> str:
+    status = str(health.get("status") or "empty")
+    status_label = {"clean": "正常", "attention": "需检查", "empty": "暂无日线"}.get(status, status)
+    freshness_status = str(health.get("freshness_status") or "unknown")
+    weekday_lag_days = health.get("weekday_lag_days")
+    freshness_label = {
+        "current": "近 1 个工作日",
+        "lagging": f"可能滞后 {weekday_lag_days} 个工作日",
+        "unknown": "无法判断",
+        "empty": "暂无日线",
+    }.get(freshness_status, freshness_status)
+    cards = [
+        ("健康状态", status_label),
+        ("最近股票日线", health.get("latest_trade_date") or "-"),
+        ("任意品种最新", health.get("latest_any_trade_date") or "-"),
+        ("数据时效", freshness_label),
+        ("日线数量", f"{int(health.get('total_bars') or 0):,}"),
+        ("覆盖标的", f"{int(health.get('total_symbols') or 0):,}"),
+        ("同日冲突", str(int(health.get("duplicate_symbol_days") or 0))),
+        ("冲突记录", str(int(health.get("duplicate_rows") or 0))),
+    ]
+    note = '<section class="panel"><p>时效按工作日间隔粗略估算，不包含交易所节假日和盘中更新状态。</p></section>'
+    return "<section class=\"metrics\">" + "".join(
+        '<article class="metric">' + f"<span>{_e(label)}</span><strong>{_e(value)}</strong>" + "</article>"
+        for label, value in cards
+    ) + "</section>" + note
+
+
+def _render_data_health_sources(health: dict[str, object]) -> str:
+    body = []
+    sources = health.get("sources", [])
+    if isinstance(sources, list):
+        for row in sources:
+            body.append(
+                "<tr>"
+                f"<td>{_e(row['source_kind'])}</td>"
+                f"<td class=\"num\">{int(row['bars']):,}</td>"
+                f"<td class=\"num\">{int(row['symbols']):,}</td>"
+                f"<td>{_e(row['first_trade_date'] or '-')}</td>"
+                f"<td>{_e(row['last_trade_date'] or '-')}</td>"
+                "</tr>"
+            )
+    if not body:
+        body.append('<tr><td colspan="5" class="empty">暂无已导入日线。</td></tr>')
+    policy = _e(str(health.get("canonical_source_policy") or "-"))
+    note = f'<section class="panel"><h2>规范来源</h2><p>{policy}</p></section>'
+    return note + _table_section("日线来源覆盖", ["来源", "日线", "标的", "最早交易日", "最近交易日"], body)
+
+
+def _render_strategy_validation_runs(rows: list[object]) -> str:
+    body = []
+    verdict_classes = {"通过": "ok", "观察": "warn", "未通过": "danger", "样本不足": "warn"}
+    for row in rows:
+        try:
+            assessment = json.loads(str(row["assessment_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            assessment = {}
+        if not isinstance(assessment, dict):
+            assessment = {}
+        try:
+            parameters = json.loads(str(row["parameters_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parameters = {}
+        if not isinstance(parameters, dict):
+            parameters = {}
+        verdict = str(row["verdict"])
+        parameter_text = (
+            f"训练 {parameters.get('train_days', '-')} / 测试 {parameters.get('test_days', '-')} 日，"
+            f"Top {parameters.get('top_n', '-')}，{parameters.get('execution_mode', '-')}"
+        )
+        body.append(
+            "<tr>"
+            f"<td>{_e(display_shanghai_time(row['run_at']))}</td>"
+            f'<td><span class="pill {verdict_classes.get(verdict, "warn")}">{_e(verdict)}</span></td>'
+            f"<td class=\"num\">{int(assessment.get('fold_count') or 0)}</td>"
+            f"<td class=\"num\">{int(assessment.get('total_trades') or 0)}</td>"
+            f"<td class=\"num\">{_validation_percent(assessment.get('portfolio_avg_return'))}</td>"
+            f"<td class=\"num\">{_validation_percent(assessment.get('benchmark_excess_return'))}</td>"
+            f"<td class=\"num\">{_validation_percent(assessment.get('max_drawdown'))}</td>"
+            f"<td>{_e(parameter_text)}</td>"
+            f"<td>{_e(row['data_fingerprint'])}</td>"
+            f"<td>{_e(row['summary'])}</td>"
+            "</tr>"
+        )
+    if not body:
+        body.append('<tr><td colspan="10" class="empty">暂无保存的样本外验证。请先运行 strategy-validate。</td></tr>')
+    return _table_section(
+        "已保存样本外验证",
+        ["运行时间", "结论", "折数", "交易", "组合平均", "基准超额", "最大回撤", "参数", "日线版本", "摘要"],
+        body,
+    )
+
+
+def _render_strategy_backtest_runs(rows: list[object]) -> str:
+    body = []
+    for row in rows:
+        try:
+            summary = json.loads(str(row["summary_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            summary = {}
+        if not isinstance(summary, dict):
+            summary = {}
+        try:
+            parameters = json.loads(str(row["parameters_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parameters = {}
+        if not isinstance(parameters, dict):
+            parameters = {}
+        excess = summary.get("excess_portfolio_avg_return")
+        parameter_text = (
+            f"持有 {parameters.get('horizon_days', '-')} 日，Top {parameters.get('top_n', '-')}，"
+            f"{parameters.get('execution_mode', '-')} / {parameters.get('position_mode', '-')}"
+        )
+        body.append(
+            "<tr>"
+            f'<td><a class="symbol-link" href="/strategy-backtest-runs/{int(row["id"])}">#{int(row["id"])}</a></td>'
+            f"<td>{_e(display_shanghai_time(row['run_at']))}</td>"
+            f"<td class=\"num\">{int(summary.get('trade_count') or 0)}</td>"
+            f"<td class=\"num\">{int(summary.get('day_count') or 0)}</td>"
+            f"<td class=\"num\">{_fmt(summary.get('win_rate'))}%</td>"
+            f"<td class=\"num\">{_fmt(summary.get('avg_return'))}%</td>"
+            f"<td class=\"num\">{_fmt(summary.get('portfolio_avg_return'))}%</td>"
+            f"<td class=\"num\">{_fmt(summary.get('max_drawdown'))}%</td>"
+            f"<td class=\"num\">{'-' if excess is None else f'{float(excess):+.2f}%'} </td>"
+            f"<td>{_e(parameter_text)}</td>"
+            f"<td>{_e(row['data_fingerprint'])}</td>"
+            "</tr>"
+        )
+    if not body:
+        body.append('<tr><td colspan="11" class="empty">暂无保存的策略回测。请先运行回测并保存结果。</td></tr>')
+    return _table_section(
+        "已保存策略回测",
+        ["ID", "运行时间", "交易", "批次", "胜率", "净均收", "组合平均", "最大回撤", "基准超额", "参数", "日线版本"],
+        body,
+    )
+
+
+def _render_daily_runs(rows: list[object]) -> str:
+    body = []
+    status_classes = {"succeeded": "ok", "failed": "danger", "running": "warn"}
+    for row in rows:
+        try:
+            summary = json.loads(str(row["summary_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            summary = {}
+        if not isinstance(summary, dict):
+            summary = {}
+        try:
+            parameters = json.loads(str(row["parameters_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parameters = {}
+        if not isinstance(parameters, dict):
+            parameters = {}
+        status = str(row["status"])
+        freshness_text = _daily_run_freshness_label(summary)
+        quote_freshness_text = _daily_run_quote_freshness_label(summary)
+        ai_snapshot_text = _daily_run_ai_snapshot_label(summary)
+        parameter_text = (
+            f"标的上限 {parameters.get('limit', '-')}，"
+            f"日线 {parameters.get('history_days', '-')} 日，"
+            f"{parameters.get('universe', '-')}"
+        )
+        body.append(
+            "<tr>"
+            f"<td>{_e(display_shanghai_time(row['started_at']))}</td>"
+            f"<td>{_e(display_shanghai_time(row['finished_at']) if row['finished_at'] else '-')}</td>"
+            f'<td><span class="pill {status_classes.get(status, "warn")}">{_e(status)}</span></td>'
+            f"<td class=\"num\">{int(summary.get('history_symbols') or 0)}</td>"
+            f"<td class=\"num\">{int(summary.get('tdx_covered_symbols') or 0)}</td>"
+            f"<td class=\"num\">{int(summary.get('tdx_daily_bars_imported') or 0):,}</td>"
+            f"<td class=\"num\">{int(summary.get('history_bars_imported') or 0):,}</td>"
+            f"<td>{_e(freshness_text)}</td>"
+            f"<td>{_e(quote_freshness_text)}</td>"
+            f"<td>{_e(ai_snapshot_text)}</td>"
+            f"<td>{_e(summary.get('failed_step') or '-')}</td>"
+            f"<td>{_e(parameter_text)}</td>"
+            f"<td>{_e(row['error_text'] or '-')}</td>"
+            "</tr>"
+        )
+    if not body:
+        body.append('<tr><td colspan="13" class="empty">暂无每日运行记录。请先运行 run-daily。</td></tr>')
+    return _table_section(
+        "最近每日运行",
+        ["开始时间", "结束时间", "状态", "标的", "TDX 已覆盖", "TDX 同步", "公开日线", "日线时效", "行情时效", "AI 快照", "失败步骤", "参数", "错误"],
+        body,
+    )
+
+
+def _daily_run_freshness_label(summary: dict[str, object]) -> str:
+    health = summary.get("daily_bar_health")
+    if not isinstance(health, dict):
+        return "-"
+    latest_date = str(health.get("latest_trade_date") or "-")
+    freshness = str(health.get("freshness_status") or "unknown")
+    lag_days = health.get("weekday_lag_days")
+    if freshness == "current":
+        return f"近 1 个工作日 · {latest_date}"
+    if freshness == "lagging":
+        return f"可能滞后 {lag_days if lag_days is not None else '-'} 个工作日 · {latest_date}"
+    if freshness == "empty":
+        return "暂无日线"
+    return f"无法判断 · {latest_date}"
+
+
+def _daily_run_quote_freshness_label(summary: dict[str, object]) -> str:
+    health = summary.get("quote_health")
+    if not isinstance(health, dict):
+        return "-"
+    latest_date = str(health.get("latest_price_date") or "-")
+    priced_symbols = int(health.get("priced_symbols") or 0)
+    freshness = str(health.get("freshness_status") or "unknown")
+    lag_days = health.get("weekday_lag_days")
+    if freshness == "current":
+        return f"近 1 个工作日 · {latest_date} · {priced_symbols} 只"
+    if freshness == "partial":
+        current_symbols = int(health.get("current_priced_symbols") or 0)
+        stale_symbols = int(health.get("stale_priced_symbols") or 0)
+        return f"近 1 日 {current_symbols} 只，可能过期 {stale_symbols} 只 · {latest_date}"
+    if freshness == "lagging":
+        return f"可能滞后 {lag_days if lag_days is not None else '-'} 个工作日 · {latest_date} · {priced_symbols} 只"
+    if freshness == "empty":
+        return "暂无带价格行情"
+    return f"无法判断 · {latest_date} · {priced_symbols} 只"
+
+
+def _daily_run_ai_snapshot_label(summary: dict[str, object]) -> str:
+    status = str(summary.get("ai_snapshot_status") or "")
+    saved_count = int(summary.get("ai_decisions_saved") or 0)
+    if status == "saved":
+        return f"已保存 {saved_count} 条"
+    if status == "empty":
+        return "无可保存候选"
+    if status == "failed":
+        return "生成失败，不影响数据更新"
+    return "-"
+
+
+def _validation_percent(value: object) -> str:
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):.2f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
 def _render_ths_processes(snapshot: THSMonitorSnapshot) -> str:
     body = []
     for item in snapshot.processes:
@@ -819,8 +1735,8 @@ def _render_factor_definitions() -> str:
     for item in factor_definitions():
         body.append(
             "<tr>"
-            f"<td>{_e(item.factor_id)}</td>"
-            f"<td>{_e(item.name)}</td>"
+            f"<td>{_factor_link(item.factor_id)}</td>"
+            f"<td>{_factor_link(item.factor_id, item.name)}</td>"
             f"<td>{_e(item.category)}</td>"
             f"<td>{_e(item.future_function_risk)}</td>"
             f"<td>{_e(item.description)}</td>"
@@ -838,7 +1754,7 @@ def _render_factor_signals(rows: list[dict[str, object]]) -> str:
             "<tr>"
             f"<td>{_symbol_link(row['symbol'])}</td>"
             f"<td>{_e(row['name'] or '-')}</td>"
-            f"<td>{_e(row['factor_name'])}</td>"
+            f"<td>{_factor_link(str(row['factor_id']), str(row['factor_name']))}</td>"
             f"<td><span class=\"pill {pill}\">{_e(row['direction'])}</span></td>"
             f"<td class=\"num\">{float(row['strength']):.1f}</td>"
             f"<td>{_e(row['reason'])}</td>"
@@ -882,8 +1798,8 @@ def _render_factor_matrix(rows: list[dict[str, object]], horizons: list[int]) ->
             "样本不足": "warn",
         }.get(str(row["verdict"]), "warn")
         cells = [
-            f"<td>{_e(row['factor_id'])}</td>",
-            f"<td>{_e(row['factor_name'])}</td>",
+            f"<td>{_factor_link(str(row['factor_id']))}</td>",
+            f"<td>{_factor_link(str(row['factor_id']), str(row['factor_name']))}</td>",
             f"<td>{_e(row['category'])}</td>",
             f'<td><span class="pill {verdict_class}">{_e(row["verdict"])}</span></td>',
             f"<td class=\"num strong\">{float(row['effectiveness_score']):.1f}</td>",
@@ -906,6 +1822,335 @@ def _render_factor_matrix(rows: list[dict[str, object]], horizons: list[int]) ->
     if not body:
         body.append(f'<tr><td colspan="{len(headers)}" class="empty">暂无回测样本，请先导入更多历史日线。</td></tr>')
     return _table_section("因子多周期回测矩阵", headers, body)
+
+
+def _render_factor_detail_summary(definition: object, signals: list[dict[str, object]], matrix: dict[str, object] | None) -> str:
+    factor = definition
+    verdict = str(matrix.get("verdict") or "样本不足") if matrix else "样本不足"
+    effectiveness = float(matrix.get("effectiveness_score") or 0.0) if matrix else 0.0
+    samples = int(matrix.get("total_samples") or 0) if matrix else 0
+    cards = [
+        ("类别", factor.category),
+        ("未来函数风险", factor.future_function_risk),
+        ("当前命中", str(len(signals))),
+        ("历史结论", verdict),
+        ("有效性评分", f"{effectiveness:.1f}"),
+        ("总样本", f"{samples:,}"),
+    ]
+    rendered = "".join(
+        '<article class="metric">'
+        f"<span>{_e(label)}</span><strong>{_e(value)}</strong>"
+        "</article>"
+        for label, value in cards
+    )
+    return (
+        '<section class="metrics">'
+        f"{rendered}"
+        "</section>"
+        '<section class="panel">'
+        "<h2>因子逻辑</h2>"
+        f"<p>{_e(factor.description)}</p>"
+        f"<p>来源：{_e(factor.source)}</p>"
+        "<p>风险边界：信号仅使用当日及以前日线计算；未来收益仅用于历史统计，不能作为交易指令。</p>"
+        "</section>"
+    )
+
+
+def _render_factor_detail_signals(rows: list[dict[str, object]]) -> str:
+    body = []
+    for row in rows:
+        pill = "danger" if row["direction"] == "risk" else "ok"
+        body.append(
+            "<tr>"
+            f"<td>{_symbol_link(row['symbol'])}</td>"
+            f"<td>{_e(row['name'] or '-')}</td>"
+            f'<td><span class="pill {pill}">{_e(row["direction"])}</span></td>'
+            f"<td class=\"num\">{float(row['strength']):.1f}</td>"
+            f"<td>{_e(row['reason'])}</td>"
+            "</tr>"
+        )
+    if not body:
+        body.append('<tr><td colspan="5" class="empty">当前扫描范围内暂无命中。</td></tr>')
+    return _table_section("当前命中", ["代码", "名称", "方向", "强度", "原因"], body)
+
+
+def _render_factor_detail_history(matrix: dict[str, object] | None) -> str:
+    horizon_rows = matrix.get("horizons") if isinstance(matrix, dict) else {}
+    body = []
+    if isinstance(horizon_rows, dict):
+        for horizon, stats in sorted(horizon_rows.items(), key=lambda item: int(item[0])):
+            if not isinstance(stats, dict):
+                continue
+            body.append(
+                "<tr>"
+                f"<td>{_e(horizon)} 个交易日</td>"
+                f"<td class=\"num\">{int(stats.get('samples') or 0):,}</td>"
+                f"<td class=\"num\">{float(stats.get('win_rate') or 0.0):.1f}%</td>"
+                f"<td class=\"num\">{float(stats.get('avg_return') or 0.0):.2f}%</td>"
+                f"<td class=\"num\">{float(stats.get('best_return') or 0.0):.2f}%</td>"
+                f"<td class=\"num\">{float(stats.get('worst_return') or 0.0):.2f}%</td>"
+                "</tr>"
+            )
+    if not body:
+        body.append('<tr><td colspan="6" class="empty">暂无足够历史样本。</td></tr>')
+    return _table_section("多周期历史表现", ["持有周期", "样本", "胜率", "平均收益", "最好", "最差"], body)
+
+
+def _render_backtest_controls(
+    horizon: int,
+    execution_mode: str,
+    position_mode: str,
+    top_n: int,
+    min_signal_score: float,
+    limit_symbols: int,
+    cost_bps: float,
+    slippage_bps: float,
+    benchmark_symbol: str,
+    max_bars: int,
+) -> str:
+    return (
+        '<section class="panel filter-panel">'
+        '<form class="filters backtest-filters" method="get" action="/backtest">'
+        '<label><span>持有天数</span>'
+        f'<input name="horizon" type="number" min="1" max="30" value="{horizon}">'
+        "</label>"
+        '<label><span>成交方式</span>'
+        '<select name="execution">'
+        f'<option value="next_open"{" selected" if execution_mode == "next_open" else ""}>次日开盘</option>'
+        f'<option value="signal_close"{" selected" if execution_mode == "signal_close" else ""}>信号日收盘</option>'
+        "</select>"
+        "</label>"
+        '<label><span>持仓方式</span>'
+        '<select name="position_mode">'
+        f'<option value="non_overlapping"{" selected" if position_mode == "non_overlapping" else ""}>不重叠</option>'
+        f'<option value="daily_batches"{" selected" if position_mode == "daily_batches" else ""}>每日批次</option>'
+        "</select>"
+        "</label>"
+        '<label><span>每日数量</span>'
+        f'<input name="top_n" type="number" min="1" max="50" value="{top_n}">'
+        "</label>"
+        '<label><span>最低信号分</span>'
+        f'<input name="min_signal_score" type="number" step="1" value="{min_signal_score:g}">'
+        "</label>"
+        '<label><span>股票上限</span>'
+        f'<input name="limit_symbols" type="number" min="10" max="5000" value="{limit_symbols}">'
+        "</label>"
+        '<label><span>成本 bps</span>'
+        f'<input name="cost_bps" type="number" min="0" max="200" step="0.1" value="{cost_bps:g}">'
+        "</label>"
+        '<label><span>滑点 bps</span>'
+        f'<input name="slippage_bps" type="number" min="0" max="200" step="0.1" value="{slippage_bps:g}">'
+        "</label>"
+        '<label><span>基准代码</span>'
+        f'<input name="benchmark_symbol" value="{_e(benchmark_symbol)}" placeholder="sh000300">'
+        "</label>"
+        '<label><span>K线数量</span>'
+        f'<input name="max_bars" type="number" min="0" max="3000" value="{max_bars}">'
+        "</label>"
+        '<button type="submit">回测</button>'
+        '<a class="ghost" href="/backtest">重置</a>'
+        '<a class="ghost" href="/strategy-backtest-runs">已保存回测</a>'
+        "</form>"
+        '<form class="inline-toolbar" method="post" action="/backtest/save">'
+        f'<input type="hidden" name="horizon" value="{horizon}">'
+        f'<input type="hidden" name="execution" value="{_e(execution_mode)}">'
+        f'<input type="hidden" name="position_mode" value="{_e(position_mode)}">'
+        f'<input type="hidden" name="top_n" value="{top_n}">'
+        f'<input type="hidden" name="min_signal_score" value="{min_signal_score:g}">'
+        f'<input type="hidden" name="limit_symbols" value="{limit_symbols}">'
+        f'<input type="hidden" name="cost_bps" value="{cost_bps:g}">'
+        f'<input type="hidden" name="slippage_bps" value="{slippage_bps:g}">'
+        f'<input type="hidden" name="benchmark_symbol" value="{_e(benchmark_symbol)}">'
+        f'<input type="hidden" name="max_bars" value="{max_bars}">'
+        '<button type="submit">保存本次回测</button>'
+        "</form>"
+        "</section>"
+    )
+
+
+def _render_backtest_summary(result: dict[str, object]) -> str:
+    benchmark = result.get("benchmark")
+    benchmark_label = "基准"
+    benchmark_value = "-"
+    benchmark_excess = "-"
+    if isinstance(benchmark, dict):
+        benchmark_label = f"基准 {benchmark.get('symbol')}"
+        if int(benchmark.get("sample_count") or 0) > 0:
+            benchmark_value = f"{float(benchmark.get('avg_return') or 0.0):.2f}%"
+            excess = result.get("excess_portfolio_avg_return")
+            benchmark_excess = "-" if excess is None else f"{float(excess):+.2f}%"
+        else:
+            benchmark_value = "样本不足"
+    execution_label = "次日开盘" if result.get("execution_mode") == "next_open" else "信号日收盘"
+    position_label = "不重叠" if result.get("position_mode") == "non_overlapping" else "每日批次（重叠）"
+    cards = [
+        ("成交方式", execution_label),
+        ("持仓方式", position_label),
+        (
+            "一字板跳过",
+            f"入场 {int(result.get('skipped_locked_entries') or 0)} / 出场 {int(result.get('skipped_locked_exits') or 0)}",
+        ),
+        ("交易数", str(result["trade_count"])),
+        ("交易日", str(result["day_count"])),
+        ("胜率", f"{float(result['win_rate']):.1f}%"),
+        ("净平均收益", f"{float(result['avg_return']):.2f}%"),
+        ("毛平均收益", f"{float(result.get('gross_avg_return') or 0.0):.2f}%"),
+        ("净组合日均", f"{float(result['portfolio_avg_return']):.2f}%"),
+        ("最大回撤", f"{float(result.get('max_drawdown') or 0.0):.2f}%"),
+        ("收益波动", f"{float(result.get('return_std') or 0.0):.2f}%"),
+        ("盈亏比", f"{float(result.get('profit_loss_ratio') or 0.0):.2f}"),
+        ("风险收益", f"{float(result.get('sharpe_like') or 0.0):.2f}"),
+        ("双边扣减", f"{float(result.get('round_trip_cost_pct') or 0.0):.2f}%"),
+        (benchmark_label, benchmark_value),
+        ("超额日均", benchmark_excess),
+        ("最差单笔", "-" if result["worst_return"] is None else f"{float(result['worst_return']):.2f}%"),
+    ]
+    rendered = []
+    for label, value in cards:
+        rendered.append(
+            '<article class="metric">'
+            f"<span>{_e(label)}</span>"
+            f"<strong>{_e(value)}</strong>"
+            "</article>"
+        )
+    position_note = "默认不重叠持仓，上一批到期后才允许下一批入场。"
+    if result.get("position_mode") == "daily_batches":
+        position_note = "每日批次会允许不同持有期的仓位重叠，仅用于研究信号的分批表现。"
+    note = (
+        '<section class="panel"><p>'
+        "说明：这是研究型回测，选股只使用当日及以前的日线因子信号；未来收益仅用于统计。"
+        "默认在下一交易日开盘买入、持有指定交易日后按收盘卖出；无成交量或缺失价格的日线会跳过。"
+        f"{position_note}"
+        "标准涨跌幅附近的一字涨跌停会跳过入场或出场；ST 历史涨跌幅仍未纳入。"
+        "净收益已按设置的买卖双边交易成本和滑点扣减。"
+        "</p></section>"
+    )
+    return '<section class="metrics">' + "".join(rendered) + "</section>" + note
+
+
+def _render_backtest_equity_chart(result: dict[str, object]) -> str:
+    rows = result.get("equity_curve", [])
+    if not isinstance(rows, list) or len(rows) < 2:
+        return '<section class="panel"><h2>组合权益曲线</h2><p class="empty">回测样本不足，暂无法绘图。</p></section>'
+
+    width = 920
+    height = 300
+    pad_x = 40
+    pad_top = 24
+    equity_height = 150
+    drawdown_top = 205
+    drawdown_height = 50
+    equities = [float(row["equity"]) for row in rows]
+    drawdowns = [float(row["drawdown"]) for row in rows]
+    min_equity = min(equities)
+    max_equity = max(equities)
+    min_drawdown = min(drawdowns)
+    equity_span = max(max_equity - min_equity, 0.001)
+    drawdown_span = max(abs(min_drawdown), 0.001)
+    step = (width - pad_x * 2) / max(len(rows) - 1, 1)
+
+    equity_points = []
+    drawdown_points = []
+    for index, row in enumerate(rows):
+        x = pad_x + step * index
+        equity = float(row["equity"])
+        drawdown = float(row["drawdown"])
+        equity_y = pad_top + (max_equity - equity) / equity_span * equity_height
+        drawdown_y = drawdown_top + abs(drawdown) / drawdown_span * drawdown_height
+        equity_points.append(f"{x:.1f},{equity_y:.1f}")
+        drawdown_points.append(f"{x:.1f},{drawdown_y:.1f}")
+
+    first_date = rows[0]["trade_date"]
+    last_date = rows[-1]["trade_date"]
+    final_return = (equities[-1] - 1) * 100
+    return (
+        '<section class="panel">'
+        "<h2>组合权益曲线</h2>"
+        '<div class="chart-wrap">'
+        f'<svg class="price-chart equity-chart" viewBox="0 0 {width} {height}" role="img" aria-label="组合权益曲线">'
+        f'<text x="{pad_x}" y="16">{_e(f"累计 {final_return:+.2f}%")}</text>'
+        f'<text x="{width - pad_x - 150}" y="16">{_e(f"最大回撤 {float(result.get("max_drawdown") or 0.0):.2f}%")}</text>'
+        f'<line x1="{pad_x}" y1="{pad_top}" x2="{width - pad_x}" y2="{pad_top}" class="grid"></line>'
+        f'<line x1="{pad_x}" y1="{pad_top + equity_height}" x2="{width - pad_x}" y2="{pad_top + equity_height}" class="grid"></line>'
+        f'<line x1="{pad_x}" y1="{drawdown_top}" x2="{width - pad_x}" y2="{drawdown_top}" class="grid"></line>'
+        f'<polyline points="{" ".join(equity_points)}" class="price-line"></polyline>'
+        f'<polyline points="{" ".join(drawdown_points)}" class="drawdown-line"></polyline>'
+        f'<text x="{pad_x}" y="{drawdown_top - 8}">权益</text>'
+        f'<text x="{pad_x}" y="{drawdown_top + drawdown_height + 18}">回撤</text>'
+        f'<text x="{pad_x}" y="{height - 10}">{_e(first_date)}</text>'
+        f'<text x="{width - pad_x - 90}" y="{height - 10}">{_e(last_date)}</text>'
+        "</svg>"
+        "</div>"
+        "</section>"
+    )
+
+
+def _render_backtest_trades(result: dict[str, object]) -> str:
+    rows = result.get("trades", [])
+    body = []
+    if isinstance(rows, list):
+        for row in rows[:80]:
+            ret = float(row["return_pct"])
+            ret_class = "pos" if ret > 0 else "neg" if ret < 0 else ""
+            body.append(
+                "<tr>"
+                f"<td>{_e(row.get('signal_date', row['trade_date']))}</td>"
+                f"<td>{_e(row['trade_date'])}</td>"
+                f"<td>{_e(row['exit_date'])}</td>"
+                f"<td>{_symbol_link(row['symbol'])}</td>"
+                f"<td>{_e(row['name'] or '-')}</td>"
+                f"<td class=\"num\">{float(row['signal_score']):.1f}</td>"
+                f"<td class=\"num {ret_class}\">{ret:.2f}%</td>"
+                f"<td class=\"num\">{float(row.get('gross_return_pct', row['return_pct'])):.2f}%</td>"
+                f"<td>{_e(row['factors'])}</td>"
+                "</tr>"
+            )
+    if not body:
+        body.append('<tr><td colspan="9" class="empty">暂无交易样本，请导入更多日线或降低最低信号分。</td></tr>')
+    return _table_section("策略交易样本", ["信号日", "买入日", "卖出日", "代码", "名称", "信号分", "净收益", "毛收益", "触发因子"], body)
+
+
+def _render_backtest_daily_returns(result: dict[str, object]) -> str:
+    rows = result.get("daily_returns", [])
+    body = []
+    if isinstance(rows, list):
+        for row in list(reversed(rows))[:40]:
+            ret = float(row["avg_return"])
+            ret_class = "pos" if ret > 0 else "neg" if ret < 0 else ""
+            body.append(
+                "<tr>"
+                f"<td>{_e(row['trade_date'])}</td>"
+                f"<td class=\"num\">{int(row['selected'])}</td>"
+                f"<td class=\"num {ret_class}\">{ret:.2f}%</td>"
+                f"<td class=\"num\">{float(row.get('gross_avg_return', row['avg_return'])):.2f}%</td>"
+                "</tr>"
+            )
+    if not body:
+        body.append('<tr><td colspan="4" class="empty">暂无每日组合收益。</td></tr>')
+    return _table_section("每日组合平均收益", ["买入日", "入选数", "净平均收益", "毛平均收益"], body)
+
+
+def _render_backtest_period_stats(result: dict[str, object], key: str, title: str) -> str:
+    period_stats = result.get("period_stats", {})
+    rows = period_stats.get(key, []) if isinstance(period_stats, dict) else []
+    body = []
+    if isinstance(rows, list):
+        for row in reversed(rows):
+            body.append(
+                "<tr>"
+                f"<td>{_e(row['period'])}</td>"
+                f"<td class=\"num\">{int(row['batches'])}</td>"
+                f"<td class=\"num\">{int(row['trades'])}</td>"
+                f"<td class=\"num\">{float(row['win_rate']):.1f}%</td>"
+                f"<td class=\"num\">{float(row['avg_return']):.2f}%</td>"
+                f"<td class=\"num\">{float(row['gross_avg_return']):.2f}%</td>"
+                f"<td class=\"num\">{float(row['cumulative_return']):.2f}%</td>"
+                f"<td class=\"num\">{float(row['max_drawdown']):.2f}%</td>"
+                "</tr>"
+            )
+    if not body:
+        body.append('<tr><td colspan="8" class="empty">暂无可归因的独立持仓批次。</td></tr>')
+    return _table_section(title, ["期间", "批次", "交易", "批次胜率", "净均收", "毛均收", "累计收益", "最大回撤"], body)
 
 
 def _render_ai_controls(limit: int, min_score: float) -> str:
@@ -938,6 +2183,7 @@ def _render_ai_decisions(decisions: list[AIDecision]) -> str:
         score = item.evidence.get("total_score")
         pct = item.evidence.get("pct_change")
         factor_text = _factor_badges(item.evidence.get("factor_signals", []))
+        quick_note = f"{item.decision}，置信度 {item.confidence:.0f}。{item.summary}"
         body.append(
             "<tr>"
             f"<td>{index}</td>"
@@ -950,11 +2196,21 @@ def _render_ai_decisions(decisions: list[AIDecision]) -> str:
             f"<td class=\"num\">{_fmt(pct)}%</td>"
             f"<td>{factor_text}</td>"
             f"<td>{_e(item.summary)}</td>"
+            '<td class="action-cell">'
+            '<form class="inline-form" method="post" action="/notes/quick-add">'
+            f'<input type="hidden" name="symbol" value="{_e(item.symbol)}">'
+            '<input type="hidden" name="status" value="watch">'
+            '<input type="hidden" name="tags" value="AI候选">'
+            f'<input type="hidden" name="note" value="{_e(quick_note)}">'
+            '<input type="hidden" name="return_to" value="/ai">'
+            '<button class="small-action" type="submit">加入观察</button>'
+            "</form>"
+            "</td>"
             "</tr>"
         )
     if not body:
-        body.append('<tr><td colspan="10" class="empty">暂无 AI 候选，请先运行 run-daily 或 score。</td></tr>')
-    return _table_section("AI 候选观点", ["#", "代码", "名称", "板块", "结论", "置信度", "评分", "涨跌幅", "公式因子", "摘要"], body)
+        body.append('<tr><td colspan="11" class="empty">暂无 AI 候选，请先运行 run-daily 或 score。</td></tr>')
+    return _table_section("AI 候选观点", ["#", "代码", "名称", "板块", "结论", "置信度", "评分", "涨跌幅", "公式因子", "摘要", "操作"], body)
 
 
 def _render_ai_history_controls(limit: int, symbol: str) -> str:
@@ -970,6 +2226,7 @@ def _render_ai_history_controls(limit: int, symbol: str) -> str:
         '<button type="submit">筛选</button>'
         '<a class="ghost" href="/ai/history">重置</a>'
         '<a class="ghost" href="/ai/changes">变化</a>'
+        '<a class="ghost" href="/ai/outcomes">复盘</a>'
         "</form>"
         "</section>"
     )
@@ -981,7 +2238,7 @@ def _render_ai_history(rows: list[object]) -> str:
         body.append(
             "<tr>"
             f"<td>#{row['id']}</td>"
-            f"<td>{_e(row['run_at'])}</td>"
+            f"<td>{_e(display_shanghai_time(row['run_at']))}</td>"
             f"<td>{_symbol_link(row['symbol'])}</td>"
             f"<td>{_e(row['name'] or '-')}</td>"
             f"<td><span class=\"pill ai-{_decision_class(row['decision'])}\">{_e(row['decision'])}</span></td>"
@@ -994,6 +2251,101 @@ def _render_ai_history(rows: list[object]) -> str:
     return _table_section("历史观点", ["ID", "保存时间", "代码", "名称", "结论", "置信度", "摘要"], body)
 
 
+def _render_ai_outcome_controls(limit: int, horizon: int, symbol: str) -> str:
+    return (
+        '<section class="panel filter-panel">'
+        '<form class="filters ai-history-filters" method="get" action="/ai/outcomes">'
+        '<label><span>代码</span>'
+        f'<input name="symbol" value="{_e(symbol)}" placeholder="可选，如 688981">'
+        "</label>"
+        '<label><span>持有日</span>'
+        f'<input name="horizon" type="number" min="1" max="60" value="{horizon}">'
+        "</label>"
+        '<label><span>数量</span>'
+        f'<input name="limit" type="number" min="1" max="300" value="{limit}">'
+        "</label>"
+        '<button type="submit">复盘</button>'
+        '<a class="ghost" href="/ai/outcomes">重置</a>'
+        '<a class="ghost" href="/ai/history">历史</a>'
+        "</form>"
+        "</section>"
+    )
+
+
+def _render_ai_outcomes(rows: list[dict[str, object]]) -> str:
+    body = []
+    for row in rows:
+        status = str(row["status"])
+        return_pct = row["return_pct"]
+        outcome_class = "pos" if return_pct is not None and float(return_pct) > 0 else "neg" if return_pct is not None and float(return_pct) < 0 else ""
+        entry = "-"
+        if row["entry_date"] is not None and row["entry_price"] is not None:
+            entry = f"{row['entry_date']} / {float(row['entry_price']):.2f}"
+        exit_text = "-"
+        if row["exit_date"] is not None and row["exit_price"] is not None:
+            exit_text = f"{row['exit_date']} / {float(row['exit_price']):.2f}"
+        outcome_text = f"{float(return_pct):+.2f}%" if return_pct is not None else str(row["status_label"])
+        body.append(
+            "<tr>"
+            f"<td>#{row['id']}</td>"
+            f"<td>{_symbol_link(row['symbol'])}</td>"
+            f"<td>{_e(row['name'] or '-')}</td>"
+            f'<td><span class="pill ai-{_decision_class(row["decision"])}">{_e(row["decision"])}</span></td>'
+            f"<td>{_e(row['score_date'] or '-')}</td>"
+            f"<td>{_e(entry)}</td>"
+            f"<td>{_e(exit_text)}</td>"
+            f"<td class=\"num {outcome_class}\">{_e(outcome_text)}</td>"
+            f"<td>{_e(row['status_label'])}</td>"
+            "</tr>"
+        )
+    if not body:
+        body.append('<tr><td colspan="9" class="empty">暂无已保存 AI 观点。</td></tr>')
+    return _table_section(
+        "AI 观点后续表现",
+        ["ID", "代码", "名称", "保存结论", "评分日", "下一日开盘", "第 N 日收盘", "后续收益", "状态"],
+        body,
+    )
+
+
+def _render_ai_outcome_summary(summary: dict[str, object]) -> str:
+    hit_rate = summary["hit_rate"]
+    average_return = summary["average_return"]
+    cards = [
+        ("独立观点", str(summary["total"])),
+        ("已完成", str(summary["evaluated"])),
+        ("待观察", str(summary["pending"])),
+        ("正收益", str(summary["positive"])),
+        ("命中率", "-" if hit_rate is None else f"{float(hit_rate):.1f}%"),
+        ("平均收益", "-" if average_return is None else f"{float(average_return):+.2f}%"),
+    ]
+    metrics = '<section class="metrics">' + "".join(
+        f'<article class="metric"><span>{_e(label)}</span><strong>{_e(value)}</strong></article>'
+        for label, value in cards
+    ) + "</section>"
+
+    body = []
+    for row in summary["by_decision"]:
+        row_hit_rate = row["hit_rate"]
+        row_average_return = row["average_return"]
+        body.append(
+            "<tr>"
+            f'<td><span class="pill ai-{_decision_class(row["decision"])}">{_e(row["decision"])}</span></td>'
+            f'<td class="num">{row["total"]}</td>'
+            f'<td class="num">{row["evaluated"]}</td>'
+            f'<td class="num">{row["positive"]}</td>'
+            f'<td class="num">{"-" if row_hit_rate is None else f"{float(row_hit_rate):.1f}%"}</td>'
+            f'<td class="num">{"-" if row_average_return is None else f"{float(row_average_return):+.2f}%"}</td>'
+            "</tr>"
+        )
+    if not body:
+        body.append('<tr><td colspan="6" class="empty">暂无可汇总的 AI 观点。</td></tr>')
+    return metrics + _table_section(
+        "按保存结论汇总",
+        ["保存结论", "观点数", "已完成", "正收益", "命中率", "平均收益"],
+        body,
+    )
+
+
 def _render_ai_changes_controls(limit: int) -> str:
     return (
         '<section class="panel filter-panel">'
@@ -1003,6 +2355,7 @@ def _render_ai_changes_controls(limit: int) -> str:
         "</label>"
         '<button type="submit">刷新</button>'
         '<a class="ghost" href="/ai/history">历史</a>'
+        '<a class="ghost" href="/ai/outcomes">复盘</a>'
         "</form>"
         "</section>"
     )
@@ -1022,7 +2375,7 @@ def _render_ai_changes(rows: list[dict[str, object]]) -> str:
             f"<td>{_e(previous)} -> {_e(row['latest_decision'])}</td>"
             f"<td class=\"num strong\">{float(row['latest_confidence']):.0f}</td>"
             f"<td class=\"num {delta_class}\">{delta:+.0f}</td>"
-            f"<td>{_e(row['latest_run_at'])}</td>"
+            f"<td>{_e(display_shanghai_time(row['latest_run_at']))}</td>"
             f"<td>{_e(row['summary'])}</td>"
             "</tr>"
         )
@@ -1045,6 +2398,8 @@ def _render_ai_symbol_decision(decision: AIDecision | None) -> str:
         return '<section class="panel"><h2>AI 观点</h2><p class="empty">暂无 AI 观点，请先运行评分。</p></section>'
     strengths = "".join(f"<li>{_e(item)}</li>" for item in decision.strengths)
     risks = "".join(f"<li>{_e(item)}</li>" for item in decision.risks)
+    trigger_conditions = "".join(f"<li>{_e(item)}</li>" for item in decision.trigger_conditions)
+    invalidation_conditions = "".join(f"<li>{_e(item)}</li>" for item in decision.invalidation_conditions)
     actions = "".join(f"<li>{_e(item)}</li>" for item in decision.next_actions)
     factor_table = _render_ai_factor_signals(decision.evidence.get("factor_signals", []))
     return (
@@ -1057,6 +2412,8 @@ def _render_ai_symbol_decision(decision: AIDecision | None) -> str:
         '<div class="ai-grid">'
         f'<div><h3>正向证据</h3><ul class="rules">{strengths}</ul></div>'
         f'<div><h3>风险点</h3><ul class="rules">{risks}</ul></div>'
+        f'<div><h3>触发条件</h3><ul class="rules">{trigger_conditions}</ul></div>'
+        f'<div><h3>失效条件</h3><ul class="rules">{invalidation_conditions}</ul></div>'
         f'<div><h3>下一步</h3><ul class="rules">{actions}</ul></div>'
         "</div>"
         f"{factor_table}"
@@ -1174,7 +2531,7 @@ def _render_stock_note(symbol: str, note: object | None) -> str:
     for value, label in [("watch", "观察"), ("hold", "持有"), ("avoid", "回避"), ("review", "复盘")]:
         selected = " selected" if value == status else ""
         options.append(f'<option value="{value}"{selected}>{label}</option>')
-    updated = f'<p class="note-updated">更新于 { _e(note["updated_at"]) }</p>' if note is not None else ""
+    updated = f'<p class="note-updated">更新于 { _e(display_shanghai_time(note["updated_at"])) }</p>' if note is not None else ""
     return (
         '<section class="panel">'
         "<h2>本地观察记录</h2>"
@@ -1251,7 +2608,7 @@ def _render_notes_table(rows: list[object], filters: NotesFilters) -> str:
             f"<td class=\"num\">{_fmt(row['total_score'])}</td>"
             f"<td class=\"num\">{_fmt(row['latest_price'])}</td>"
             f"<td class=\"num\">{_fmt(row['pct_change'])}%</td>"
-            f"<td>{_e(row['updated_at'])}</td>"
+            f"<td>{_e(display_shanghai_time(row['updated_at']))}</td>"
             '<td class="action-cell">'
             '<form class="inline-form" method="post" action="/notes/delete">'
             f'<input type="hidden" name="symbol" value="{_e(row["symbol"])}">'
@@ -1435,12 +2792,19 @@ def _topbar(title: str, subtitle: str, back_link: str | None = None) -> str:
         "</div>"
         f"{action}"
         "</section>"
+        + _render_app_nav(_active_path_for_title(title))
     )
 
 
 def _symbol_link(symbol: object) -> str:
     text = _e(symbol)
     return f'<a class="symbol-link" href="/symbol/{text}">{text}</a>'
+
+
+def _factor_link(factor_id: str, label: str | None = None) -> str:
+    factor_text = _e(factor_id)
+    label_text = _e(label if label is not None else factor_id)
+    return f'<a class="symbol-link" href="/factors/{factor_text}">{label_text}</a>'
 
 
 def _top_rules(raw: str) -> str:
@@ -1505,31 +2869,100 @@ _CSS = """
 :root {
   color-scheme: light;
   font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
-  background: #f5f7fa;
+  background: #f4f6f8;
   color: #1f2933;
 }
 * { box-sizing: border-box; }
+html { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
 body { margin: 0; }
 .shell { width: min(1440px, calc(100% - 32px)); margin: 0 auto; padding: 24px 0 40px; }
 .topbar { display: flex; justify-content: space-between; gap: 16px; align-items: flex-end; margin-bottom: 18px; }
-h1 { margin: 0; font-size: 28px; font-weight: 700; }
-h2 { margin: 0 0 12px; font-size: 18px; font-weight: 700; }
+h1 { margin: 0; font-size: 28px; font-weight: 700; text-wrap: balance; }
+h2 { margin: 0 0 12px; font-size: 18px; font-weight: 700; text-wrap: balance; }
 h3 { margin: 0 0 8px; font-size: 14px; font-weight: 700; color: #334155; }
-p { margin: 8px 0 0; color: #5f6c7b; font-size: 13px; }
+p { margin: 8px 0 0; color: #5f6c7b; font-size: 13px; line-height: 1.7; text-wrap: pretty; }
 .refresh {
   display: inline-flex; align-items: center; justify-content: center;
-  min-height: 36px; padding: 0 14px; border-radius: 6px;
+  min-height: 40px; padding: 0 14px; border-radius: 6px;
   color: #0f766e; background: #dff6f1; text-decoration: none; font-weight: 600;
+  transition-property: transform, background-color, box-shadow;
+  transition-duration: 160ms;
+  transition-timing-function: ease-out;
 }
+.refresh:hover { background: #c8efe7; box-shadow: 0 1px 0 rgba(15, 118, 110, 0.12); }
+.refresh:active { transform: scale(0.98); }
+.primary-action { color: #ffffff; background: #0f766e; }
+.primary-action:hover { background: #115e59; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .symbol-link { color: #0f766e; font-weight: 700; text-decoration: none; }
 .symbol-link:hover, .refresh:hover { text-decoration: underline; }
+.app-nav {
+  display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+  padding: 8px; margin: -4px 0 16px; border: 1px solid #d8e0e8;
+  border-radius: 8px; background: #ffffff;
+}
+.nav-link {
+  min-height: 38px; display: inline-flex; align-items: center; justify-content: center;
+  padding: 0 12px; border-radius: 6px; color: #475569; text-decoration: none; font-weight: 700;
+  transition-property: background-color, color, transform;
+  transition-duration: 160ms;
+  transition-timing-function: ease-out;
+}
+.nav-link:hover { color: #0f766e; background: #eef7f5; }
+.nav-link:active { transform: scale(0.98); }
+.nav-link.active { color: #ffffff; background: #0f766e; }
+.hero-panel {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(180px, 240px);
+  gap: 18px; align-items: stretch; padding: 20px; margin-bottom: 14px;
+  background: #ffffff; border: 1px solid #d8e0e8; border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(31, 41, 51, 0.06);
+}
+.hero-copy h2 { margin: 4px 0 8px; font-size: 24px; line-height: 1.25; }
+.eyebrow { color: #0f766e; font-size: 12px; font-weight: 800; letter-spacing: 0; }
+.hero-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.hero-status {
+  display: grid; align-content: center; justify-items: start; gap: 6px;
+  padding: 16px; border: 1px solid #d8e0e8; border-radius: 6px; background: #f8fafc;
+}
+.hero-status strong { font-size: 30px; line-height: 1; font-variant-numeric: tabular-nums; }
+.hero-status small { color: #64748b; font-weight: 700; }
+.workflow { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
+.workflow-step {
+  display: grid; grid-template-columns: 34px minmax(0, 1fr); column-gap: 10px; row-gap: 4px;
+  min-height: 92px; padding: 12px; border: 1px solid #d8e0e8; border-radius: 8px;
+  background: #ffffff; color: #334155; text-decoration: none;
+  transition-property: transform, border-color, box-shadow;
+  transition-duration: 160ms;
+  transition-timing-function: ease-out;
+}
+.workflow-step:hover { border-color: #0f766e; box-shadow: 0 8px 18px rgba(31, 41, 51, 0.08); transform: translateY(-1px); }
+.workflow-step strong { align-self: center; }
+.workflow-step small { grid-column: 2; color: #64748b; line-height: 1.45; text-wrap: pretty; }
+.step-index {
+  width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 999px; color: #0f766e; background: #dff6f1; font-weight: 800;
+}
+.guide-panel {
+  display: flex; justify-content: space-between; gap: 14px; align-items: center;
+  padding: 14px 16px; margin-top: 14px; border: 1px solid #cfe8e2;
+  border-radius: 8px; background: #f2fbf8;
+}
+.guide-panel h2 { margin-bottom: 4px; font-size: 16px; }
+.guide-panel p { margin: 0; max-width: 820px; }
+.guide-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.data-freshness-warning {
+  display: flex; justify-content: space-between; gap: 14px; align-items: center;
+  padding: 14px 16px; margin: 14px 0; border: 1px solid #fdba74;
+  border-radius: 8px; background: #fff7ed;
+}
+.data-freshness-warning h2 { margin-bottom: 4px; font-size: 16px; color: #9a3412; }
+.data-freshness-warning p { margin: 0; max-width: 820px; color: #7c2d12; }
 .metrics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
 .detail-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .ths-metrics { grid-template-columns: minmax(120px, 0.8fr) minmax(180px, 1fr) minmax(240px, 1.4fr) minmax(260px, 1.8fr); }
 .metric { background: #ffffff; border: 1px solid #d8e0e8; border-radius: 8px; padding: 14px; }
 .metric span { display: block; color: #64748b; font-size: 12px; margin-bottom: 8px; }
-.metric strong { font-size: 24px; line-height: 1; }
+.metric strong { font-size: 24px; line-height: 1; font-variant-numeric: tabular-nums; }
 .wide-metric strong { font-size: 15px; line-height: 1.35; overflow-wrap: anywhere; }
 .panel { background: #ffffff; border: 1px solid #d8e0e8; border-radius: 8px; padding: 16px; margin-top: 14px; }
 .filter-panel { padding: 12px 16px; }
@@ -1540,13 +2973,19 @@ p { margin: 8px 0 0; color: #5f6c7b; font-size: 13px; }
   padding: 0 10px; background: #ffffff; color: #1f2933; font: inherit;
 }
 .filters button, .ghost {
-  height: 36px; border: 0; border-radius: 6px; padding: 0 14px; font-weight: 700;
+  min-height: 40px; border: 0; border-radius: 6px; padding: 0 14px; font-weight: 700;
   display: inline-flex; align-items: center; justify-content: center; text-decoration: none;
+  transition-property: transform, background-color, box-shadow;
+  transition-duration: 160ms;
+  transition-timing-function: ease-out;
 }
 .filters button { background: #0f766e; color: #ffffff; cursor: pointer; }
 .ghost { color: #475569; background: #e2e8f0; }
+.filters button:hover, .ghost:hover { box-shadow: 0 1px 0 rgba(31, 41, 51, 0.12); }
+.filters button:active, .ghost:active { transform: scale(0.98); }
 .ai-filters { grid-template-columns: minmax(120px, 180px) minmax(120px, 180px) auto auto auto; }
 .ai-history-filters { grid-template-columns: minmax(160px, 220px) minmax(120px, 160px) auto auto; }
+.backtest-filters { grid-template-columns: repeat(10, minmax(100px, 155px)) auto auto; }
 .news-filters { grid-template-columns: minmax(220px, 1fr) minmax(130px, 180px) minmax(100px, 140px) auto auto; }
 .note-form { display: grid; grid-template-columns: minmax(120px, 0.5fr) minmax(220px, 1fr) auto; gap: 10px; align-items: end; }
 .note-form label { display: grid; gap: 5px; color: #52616f; font-size: 12px; font-weight: 700; }
@@ -1566,6 +3005,7 @@ p { margin: 8px 0 0; color: #5f6c7b; font-size: 13px; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { padding: 10px 8px; border-bottom: 1px solid #e6edf3; text-align: left; white-space: nowrap; }
 th { color: #52616f; font-weight: 700; background: #f8fafc; }
+tbody tr:hover { background: #fbfdfd; }
 td:last-child { white-space: normal; min-width: 220px; }
 .action-cell { white-space: nowrap !important; min-width: 0 !important; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -1601,6 +3041,15 @@ td:last-child { white-space: normal; min-width: 220px; }
 .segment.active { background: #0f766e; color: #ffffff; }
 .notes-filters { margin-top: 12px; grid-template-columns: minmax(220px, 1fr) minmax(130px, 180px) auto auto auto; }
 .inline-form { margin: 0; }
+.small-action {
+  min-height: 32px; border: 0; border-radius: 6px; padding: 0 10px; cursor: pointer;
+  background: #dff6f1; color: #0f766e; font-weight: 800;
+  transition-property: transform, background-color, box-shadow;
+  transition-duration: 160ms;
+  transition-timing-function: ease-out;
+}
+.small-action:hover { background: #c8efe7; box-shadow: 0 1px 0 rgba(15, 118, 110, 0.12); }
+.small-action:active { transform: scale(0.98); }
 .inline-toolbar { display: flex; gap: 8px; margin: 12px 0 0; }
 .inline-toolbar button {
   height: 34px; border: 0; border-radius: 6px; padding: 0 12px; cursor: pointer;
@@ -1623,8 +3072,14 @@ td:last-child { white-space: normal; min-width: 220px; }
 .price-chart text { fill: #64748b; font-size: 12px; }
 .price-chart .grid { stroke: #d8e0e8; stroke-width: 1; }
 .price-line { fill: none; stroke: #0f766e; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+.drawdown-line { fill: none; stroke: #b42318; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+.equity-chart .price-line { stroke: #0f766e; }
 .volume-bars rect { fill: #94a3b8; opacity: 0.55; }
 @media (max-width: 900px) {
+  .hero-panel { grid-template-columns: 1fr; }
+  .workflow { grid-template-columns: 1fr; }
+  .guide-panel { align-items: flex-start; flex-direction: column; }
+  .data-freshness-warning { align-items: flex-start; flex-direction: column; }
   .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .ai-grid { grid-template-columns: 1fr; }

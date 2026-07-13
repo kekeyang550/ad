@@ -4,26 +4,36 @@ import tempfile
 import unittest
 import json
 import io
+import struct
 from contextlib import redirect_stdout
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
-from ths_stock_picker.ai_decision import analyze_symbol, rank_candidates
+from ths_stock_picker.ai_decision import AIDecision, analyze_symbol, rank_candidates
 from ths_stock_picker.cli import main
 from ths_stock_picker.history_import import DailyBar
 from ths_stock_picker.news_import import load_ths_news_xml
 from ths_stock_picker.quote_observer import QuoteObservation
-from ths_stock_picker.storage import Repository
+from ths_stock_picker.storage import Repository, assess_strategy_walk_forward, summarize_ai_decision_outcomes
 from ths_stock_picker.ths_monitor import inspect_ths_source
-from ths_stock_picker.models import Security, WatchlistEntry
+from ths_stock_picker.models import QuoteRealtime, Security, WatchlistEntry
 from ths_stock_picker.web_panel import (
     DashboardFilters,
     NotesFilters,
     render_candidates_csv,
     render_dashboard,
+    render_data_health_page,
+    render_daily_runs_page,
+    render_strategy_validation_page,
+    render_strategy_backtest_runs_page,
+    render_strategy_backtest_run_detail_page,
     render_ai_page,
     render_ai_history_page,
     render_ai_changes_page,
+    render_ai_outcomes_page,
+    render_backtest_page,
+    render_factor_detail_page,
     render_factors_page,
     render_notes_csv,
     render_notes_page,
@@ -35,6 +45,847 @@ from tests.test_ths_local import make_fake_ths
 
 
 class StorageCliTests(unittest.TestCase):
+    def test_daily_bars_prefer_tdx_source_and_report_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                tdx_source = Path("tdx://lday/sz/sz000001.day")
+                tencent_source = Path("tencent://sz000001/qfqday")
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date=f"2026-06-{day:02d}",
+                            open=10 + day,
+                            high=10 + day + 0.2,
+                            low=10 + day - 0.2,
+                            close=10 + day,
+                            volume=1_000_000 + day,
+                            amount=None,
+                            source_file=tdx_source,
+                        )
+                        for day in range(1, 6)
+                    ]
+                )
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date=f"2026-06-{day:02d}",
+                            open=20 + day,
+                            high=20 + day + 0.2,
+                            low=20 + day - 0.2,
+                            close=20 + day,
+                            volume=2_000_000 + day,
+                            amount=None,
+                            source_file=tencent_source,
+                        )
+                        for day in range(1, 6)
+                    ]
+                )
+                canonical = repo.daily_bars_for_symbol("000001")
+                recent = repo.recent_daily_bars("000001", limit=2)
+                health = repo.daily_bar_health()
+            finally:
+                repo.close()
+
+            self.assertEqual([row["close"] for row in canonical], [11, 12, 13, 14, 15])
+            self.assertEqual([row["close"] for row in recent], [15, 14])
+            self.assertEqual(health["duplicate_symbol_days"], 5)
+            self.assertEqual(health["status"], "attention")
+            self.assertEqual(health["sources"][0]["source_kind"], "tdx_unadjusted")
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(main(["--db", str(db), "data-health"]), 0)
+            self.assertIn("Canonical source precedence", output.getvalue())
+
+    def test_data_health_web_page_renders_source_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date="2026-07-08",
+                            open=10.0,
+                            high=10.2,
+                            low=9.8,
+                            close=10.0,
+                            volume=1_000_000,
+                            amount=None,
+                            source_file=Path("tdx://lday/sz/sz000001.day"),
+                        ),
+                        DailyBar(
+                            symbol="sh118069",
+                            trade_date="2026-06-09",
+                            open=100.0,
+                            high=101.0,
+                            low=99.0,
+                            close=100.0,
+                            volume=1_000_000,
+                            amount=None,
+                            source_file=Path("tdx://lday/sh/sh118069.day"),
+                        ),
+                    ]
+                )
+                html = render_data_health_page(repo)
+            finally:
+                repo.close()
+
+            self.assertIn("日线数据健康", html)
+            self.assertIn("tdx_unadjusted", html)
+            self.assertIn("规范来源", html)
+            self.assertIn("最近股票日线", html)
+
+    def test_daily_bar_health_reports_latest_date_and_weekday_lag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date="2026-06-05",
+                            open=10.0,
+                            high=10.2,
+                            low=9.8,
+                            close=10.0,
+                            volume=1_000_000,
+                            amount=None,
+                            source_file=Path("tdx://lday/sz/sz000001.day"),
+                        ),
+                        DailyBar(
+                            symbol="sh118069",
+                            trade_date="2026-06-09",
+                            open=100.0,
+                            high=101.0,
+                            low=99.0,
+                            close=100.0,
+                            volume=1_000_000,
+                            amount=None,
+                            source_file=Path("tdx://lday/sh/sh118069.day"),
+                        ),
+                    ]
+                )
+                health = repo.daily_bar_health(as_of=date(2026, 6, 9))
+                freshness = repo.daily_bar_freshness(as_of=date(2026, 6, 9))
+            finally:
+                repo.close()
+
+        self.assertEqual(health["status"], "clean")
+        self.assertEqual(health["latest_trade_date"], "2026-06-05")
+        self.assertEqual(health["latest_any_trade_date"], "2026-06-09")
+        self.assertEqual(health["weekday_lag_days"], 2)
+        self.assertEqual(health["freshness_status"], "lagging")
+        self.assertEqual(freshness["latest_trade_date"], "2026-06-05")
+        self.assertEqual(freshness["weekday_lag_days"], 2)
+        self.assertEqual(freshness["freshness_status"], "lagging")
+
+    def test_quote_health_reports_empty_current_and_lagging_prices(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                empty = repo.quote_health(as_of=date(2026, 7, 9))
+                repo.upsert_public_quotes(
+                    [
+                        QuoteObservation(
+                            symbol="600000",
+                            name="浦发银行",
+                            latest_price=12.0,
+                            pct_change=1.0,
+                            volume=20_000_000,
+                            amount=200_000_000,
+                            open=11.8,
+                            high=12.1,
+                            low=11.7,
+                            previous_close=11.88,
+                            observed_at="2026-07-08 10:52:47",
+                            source="test",
+                            market_cap=100_000_000_000,
+                            turnover_rate=1.0,
+                            board="沪主板",
+                        )
+                    ]
+                )
+                current = repo.quote_health(as_of=date(2026, 7, 9))
+                lagging = repo.quote_health(as_of=date(2026, 7, 13))
+                repo.upsert_public_quotes(
+                    [
+                        QuoteObservation(
+                            symbol="000001",
+                            name="平安银行",
+                            latest_price=10.0,
+                            pct_change=1.0,
+                            volume=20_000_000,
+                            amount=200_000_000,
+                            open=9.8,
+                            high=10.1,
+                            low=9.7,
+                            previous_close=9.88,
+                            observed_at="2026-07-13 10:52:47",
+                            source="test",
+                            market_cap=100_000_000_000,
+                            turnover_rate=1.0,
+                            board="深主板",
+                        )
+                    ]
+                )
+                partial = repo.quote_health(as_of=date(2026, 7, 13))
+                ai_html = render_ai_page(repo)
+            finally:
+                repo.close()
+
+        self.assertEqual(empty["freshness_status"], "empty")
+        self.assertEqual(current["freshness_status"], "current")
+        self.assertEqual(current["priced_symbols"], 1)
+        self.assertEqual(lagging["freshness_status"], "lagging")
+        self.assertEqual(lagging["weekday_lag_days"], 3)
+        self.assertEqual(partial["freshness_status"], "partial")
+        self.assertEqual(partial["current_priced_symbols"], 1)
+        self.assertEqual(partial["stale_priced_symbols"], 1)
+        self.assertIn("行情时效提醒", ai_html)
+
+    def test_lagging_daily_bars_render_warning_on_research_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date="2020-01-02",
+                            open=10.0,
+                            high=10.2,
+                            low=9.8,
+                            close=10.0,
+                            volume=1_000_000,
+                            amount=None,
+                            source_file=Path("tdx://lday/sz/sz000001.day"),
+                        )
+                    ]
+                )
+                dashboard_html = render_dashboard(repo)
+                pages = [
+                    dashboard_html,
+                    render_ai_page(repo),
+                    render_factors_page(repo, limit=1),
+                    render_backtest_page(repo, limit_symbols=1, max_bars=10),
+                ]
+            finally:
+                repo.close()
+
+        for page in pages:
+            self.assertIn("日线时效提醒", page)
+        self.assertIn("行情待补齐", dashboard_html)
+
+    def test_strategy_backtest_next_open_execution_uses_matching_benchmark_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                start = datetime(2026, 1, 1)
+                stock_bars = []
+                benchmark_bars = []
+                for day in range(45):
+                    trade_date = (start + timedelta(days=day)).strftime("%Y-%m-%d")
+                    close = 10.0 + day * 0.2
+                    stock_bars.append(
+                        DailyBar(
+                            symbol="000001",
+                            trade_date=trade_date,
+                            open=close + 0.5,
+                            high=close + 0.8,
+                            low=close - 1.0,
+                            close=close,
+                            volume=10_000_000,
+                            amount=None,
+                            source_file=Path("test"),
+                        )
+                    )
+                    benchmark_close = 100.0 + day * 0.4
+                    benchmark_bars.append(
+                        DailyBar(
+                            symbol="sh000300",
+                            trade_date=trade_date,
+                            open=benchmark_close + 1.0,
+                            high=benchmark_close + 1.2,
+                            low=benchmark_close - 0.5,
+                            close=benchmark_close,
+                            volume=100_000_000,
+                            amount=None,
+                            source_file=Path("benchmark"),
+                        )
+                    )
+                repo.upsert_daily_bars(stock_bars)
+                repo.upsert_daily_bars(benchmark_bars)
+                result = repo.strategy_backtest(
+                    horizon_days=2,
+                    top_n=1,
+                    min_signal_score=-100,
+                    limit_symbols=1,
+                    benchmark_symbol="sh000300",
+                    max_bars=45,
+                    execution_mode="next_open",
+                )
+            finally:
+                repo.close()
+
+            self.assertEqual(result["execution_mode"], "next_open")
+            self.assertEqual(result["position_mode"], "non_overlapping")
+            self.assertTrue(result["trades"])
+            period_stats = result["period_stats"]
+            self.assertTrue(period_stats["monthly"])
+            self.assertTrue(any(row["period"] == "2026-01" for row in period_stats["monthly"]))
+            self.assertEqual(sum(int(row["batches"]) for row in period_stats["monthly"]), result["day_count"])
+            self.assertEqual(sum(int(row["batches"]) for row in period_stats["yearly"]), result["day_count"])
+            signal_dates = sorted({str(row["signal_date"]) for row in result["trades"]})
+            self.assertGreater(len(signal_dates), 1)
+            for previous, current in zip(signal_dates, signal_dates[1:]):
+                self.assertGreaterEqual(
+                    datetime.strptime(current, "%Y-%m-%d") - datetime.strptime(previous, "%Y-%m-%d"),
+                    timedelta(days=2),
+                )
+            first_trade = result["trades"][-1]
+            signal_at = datetime.strptime(str(first_trade["signal_date"]), "%Y-%m-%d")
+            self.assertEqual(first_trade["trade_date"], (signal_at + timedelta(days=1)).strftime("%Y-%m-%d"))
+            self.assertEqual(first_trade["exit_date"], (signal_at + timedelta(days=2)).strftime("%Y-%m-%d"))
+            expected_entry = 10.0 + (signal_at - start).days * 0.2 + 0.2 + 0.5
+            expected_exit = 10.0 + (signal_at - start).days * 0.2 + 0.4
+            self.assertAlmostEqual(float(first_trade["entry_price"]), expected_entry)
+            self.assertAlmostEqual(float(first_trade["gross_return_pct"]), (expected_exit / expected_entry - 1) * 100)
+            benchmark = result["benchmark"]
+            self.assertIsNotNone(benchmark)
+            self.assertEqual(benchmark["daily_returns"][0]["trade_date"], first_trade["trade_date"])
+
+    def test_strategy_backtest_skips_locked_limit_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                start = datetime(2026, 1, 1)
+                bars = []
+                for day in range(45):
+                    trade_date = (start + timedelta(days=day)).strftime("%Y-%m-%d")
+                    close = 10.0 + day * 0.2
+                    if day == 20:
+                        close = (10.0 + 19 * 0.2) * 1.1
+                        open_price = close
+                        high = close
+                        low = close
+                    else:
+                        open_price = close + 0.5
+                        high = close + 0.8
+                        low = close - 1.0
+                    bars.append(
+                        DailyBar(
+                            symbol="000001",
+                            trade_date=trade_date,
+                            open=open_price,
+                            high=high,
+                            low=low,
+                            close=close,
+                            volume=10_000_000,
+                            amount=None,
+                            source_file=Path("test"),
+                        )
+                    )
+                repo.upsert_daily_bars(bars)
+                result = repo.strategy_backtest(
+                    horizon_days=2,
+                    top_n=1,
+                    min_signal_score=-100,
+                    limit_symbols=1,
+                    max_bars=45,
+                )
+            finally:
+                repo.close()
+
+            locked_entry_date = (start + timedelta(days=20)).strftime("%Y-%m-%d")
+            self.assertGreaterEqual(result["skipped_locked_entries"], 1)
+            self.assertFalse(any(row["entry_date"] == locked_entry_date for row in result["trades"]))
+
+    def test_strategy_walk_forward_keeps_training_and_test_windows_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                start = datetime(2025, 1, 1)
+                bars = []
+                for day in range(80):
+                    close = 10.0 + day * 0.08
+                    bars.append(
+                        DailyBar(
+                            symbol="000001",
+                            trade_date=(start + timedelta(days=day)).strftime("%Y-%m-%d"),
+                            open=close + 0.1,
+                            high=close + 0.2,
+                            low=close - 1.0,
+                            close=close,
+                            volume=10_000_000,
+                            amount=None,
+                            source_file=Path("test"),
+                        )
+                    )
+                repo.upsert_daily_bars(bars)
+                result = repo.strategy_walk_forward(
+                    train_days=30,
+                    test_days=15,
+                    max_folds=2,
+                    horizon_days=2,
+                    top_n=1,
+                    min_signal_score=-100,
+                    limit_symbols=1,
+                )
+            finally:
+                repo.close()
+
+            self.assertEqual(result["validation_mode"], "walk_forward")
+            self.assertEqual(len(result["folds"]), 2)
+            first, second = result["folds"]
+            self.assertLess(first["train_end_date"], first["test_start_date"])
+            self.assertLess(second["train_end_date"], second["test_start_date"])
+            self.assertGreater(second["train_end_date"], first["train_end_date"])
+            self.assertGreaterEqual(result["total_test_days"], 1)
+
+    def test_walk_forward_assessment_rejects_negative_out_of_sample_result(self) -> None:
+        assessment = assess_strategy_walk_forward(
+            {
+                "validation_mode": "walk_forward",
+                "folds": [
+                    {
+                        "fold": 1,
+                        "trade_count": 35,
+                        "test_days": 8,
+                        "portfolio_avg_return": -0.40,
+                        "max_drawdown": -7.0,
+                        "benchmark": {"sample_count": 8, "avg_return": 0.10},
+                    },
+                    {
+                        "fold": 2,
+                        "trade_count": 35,
+                        "test_days": 8,
+                        "portfolio_avg_return": -0.10,
+                        "max_drawdown": -6.0,
+                        "benchmark": {"sample_count": 8, "avg_return": 0.05},
+                    },
+                ],
+                "total_test_days": 16,
+                "total_trades": 70,
+            },
+            min_folds=2,
+            min_trades=60,
+        )
+
+        self.assertEqual(assessment["verdict"], "未通过")
+        self.assertEqual(assessment["positive_fold_count"], 0)
+        self.assertLess(float(assessment["portfolio_avg_return"]), 0.0)
+        self.assertLess(float(assessment["benchmark_excess_return"]), 0.0)
+
+    def test_strategy_validation_run_is_saved_with_data_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                run_id = repo.save_strategy_validation_run(
+                    parameters={"train_days": 252, "test_days": 63, "top_n": 10},
+                    result={"folds": [], "total_trades": 0},
+                    assessment={"verdict": "样本不足", "summary": "测试样本不足。"},
+                )
+                rows = repo.strategy_validation_runs(limit=5)
+            finally:
+                repo.close()
+
+        self.assertGreater(run_id, 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["verdict"], "样本不足")
+        self.assertIn("daily_bars_v=", rows[0]["data_fingerprint"])
+        self.assertEqual(json.loads(rows[0]["parameters_json"])["top_n"], 10)
+
+    def test_strategy_validation_runs_command_lists_saved_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.save_strategy_validation_run(
+                    parameters={"train_days": 252},
+                    result={"folds": [], "total_trades": 0},
+                    assessment={"verdict": "样本不足", "summary": "测试样本不足。"},
+                )
+            finally:
+                repo.close()
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(main(["--db", str(db), "strategy-validation-runs", "--limit", "5"]), 0)
+
+        self.assertIn("verdict=样本不足", output.getvalue())
+
+    def test_strategy_validation_web_page_renders_saved_assessment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.save_strategy_validation_run(
+                    parameters={"train_days": 252, "benchmark_symbol": "sh000300"},
+                    result={"folds": [], "total_trades": 0},
+                    assessment={
+                        "verdict": "未通过",
+                        "summary": "样本外收益未达标。",
+                        "fold_count": 3,
+                        "total_trades": 190,
+                        "portfolio_avg_return": -0.26,
+                        "benchmark_excess_return": -0.44,
+                        "max_drawdown": -14.11,
+                    },
+                )
+                html = render_strategy_validation_page(repo)
+            finally:
+                repo.close()
+
+        self.assertIn("策略样本外验证", html)
+        self.assertIn("未通过", html)
+        self.assertIn("-0.44%", html)
+        self.assertIn("日线版本", html)
+
+    def test_strategy_backtest_run_is_saved_and_rendered(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                run_id = repo.save_strategy_backtest_run(
+                    parameters={"horizon_days": 5, "top_n": 10, "execution_mode": "next_open", "position_mode": "non_overlapping"},
+                    result={
+                        "trade_count": 24,
+                        "day_count": 3,
+                        "win_rate": 58.3,
+                        "avg_return": 0.8,
+                        "gross_avg_return": 0.9,
+                        "portfolio_avg_return": 0.7,
+                        "max_drawdown": -3.2,
+                        "best_return": 4.2,
+                        "worst_return": -2.1,
+                        "round_trip_cost_pct": 0.2,
+                        "execution_mode": "next_open",
+                        "position_mode": "non_overlapping",
+                        "skipped_locked_entries": 1,
+                        "skipped_locked_exits": 0,
+                        "excess_portfolio_avg_return": 0.3,
+                        "benchmark": {"symbol": "sh000300", "sample_count": 3, "avg_return": 0.4, "cumulative_return": 1.2, "max_drawdown": -1.0},
+                    },
+                )
+                rows = repo.strategy_backtest_runs(limit=5)
+                html = render_strategy_backtest_runs_page(repo, saved_run_id=run_id)
+            finally:
+                repo.close()
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(main(["--db", str(db), "strategy-backtest-runs", "--limit", "5"]), 0)
+
+        self.assertGreater(run_id, 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(json.loads(rows[0]["summary_json"])["trade_count"], 24)
+        self.assertIn("已保存策略回测", html)
+        self.assertIn("已保存策略回测记录", html)
+        self.assertIn("0.30%", html)
+        self.assertIn("trades=24", output.getvalue())
+
+    def test_daily_run_lifecycle_persists_parameters_summary_and_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                run_id = repo.start_daily_run({"limit": 200, "universe": "auto"})
+                repo.finish_daily_run(
+                    run_id,
+                    status="succeeded",
+                    summary={"history_bars_imported": 120, "artifacts": ["outputs/daily_report.md"]},
+                )
+                rows = repo.daily_runs(limit=5)
+            finally:
+                repo.close()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "succeeded")
+        self.assertEqual(json.loads(rows[0]["parameters_json"])["universe"], "auto")
+        self.assertEqual(json.loads(rows[0]["summary_json"])["history_bars_imported"], 120)
+        self.assertIsNotNone(rows[0]["finished_at"])
+
+    def test_audit_run_tables_can_be_exported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = Repository(root / "picker.db")
+            try:
+                repo.init_schema()
+                daily_run_id = repo.start_daily_run({"limit": 200})
+                repo.finish_daily_run(daily_run_id, "succeeded", {"history_bars_imported": 0})
+                repo.save_strategy_validation_run(
+                    parameters={"train_days": 252},
+                    result={"folds": [], "total_trades": 0},
+                    assessment={"verdict": "样本不足", "summary": "测试样本不足。"},
+                )
+                daily_export_count = repo.export_table_csv("daily_runs", root / "daily_runs.csv")
+                validation_export_count = repo.export_table_csv(
+                    "strategy_validation_runs", root / "strategy_validation_runs.csv"
+                )
+            finally:
+                repo.close()
+
+            daily_csv = (root / "daily_runs.csv").read_text(encoding="utf-8-sig")
+            validation_csv = (root / "strategy_validation_runs.csv").read_text(encoding="utf-8-sig")
+
+        self.assertEqual(daily_export_count, 1)
+        self.assertEqual(validation_export_count, 1)
+        self.assertIn("summary_json", daily_csv)
+        self.assertIn("assessment_json", validation_csv)
+
+    def test_public_history_supplement_excludes_symbols_with_tdx_bars(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date="2026-07-08",
+                            open=10.0,
+                            high=10.2,
+                            low=9.8,
+                            close=10.0,
+                            volume=1_000_000,
+                            amount=None,
+                            source_file=Path("tdx://lday/sz/sz000001.day"),
+                        )
+                    ]
+                )
+                missing = repo.symbols_without_tdx_daily_bars(["000001", "000002", "000003"])
+            finally:
+                repo.close()
+
+        self.assertEqual(missing, ["000002", "000003"])
+
+    def test_tdx_status_cli_reports_stock_and_index_latest_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tdx_root = root / "tdx"
+            sh = tdx_root / "vipdoc" / "sh" / "lday"
+            sh.mkdir(parents=True)
+            stock_payload = struct.pack("IIIIIfII", 20260708, 100, 101, 99, 100, 1000.0, 100, 0)
+            index_payload = struct.pack("IIIIIfII", 20260709, 100, 101, 99, 100, 1000.0, 100, 0)
+            (sh / "sh600000.day").write_bytes(stock_payload)
+            (sh / "sh000300.day").write_bytes(index_payload)
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(main(["--db", str(root / "picker.db"), "tdx-status", "--tdx-root", str(tdx_root)]), 0)
+
+        self.assertIn("stock_latest_trade_date=2026-07-08", output.getvalue())
+        self.assertIn("index_latest_trade_date=2026-07-09", output.getvalue())
+
+    def test_run_daily_can_incrementally_import_tdx_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / "picker.db"
+            ths_root = make_fake_ths(root)
+            tdx_root = root / "tdx"
+            lday = tdx_root / "vipdoc" / "sh" / "lday"
+            lday.mkdir(parents=True)
+            (lday / "sh600000.day").write_bytes(
+                struct.pack("IIIIIfII", 20260709, 1000, 1020, 990, 1010, 1_000_000.0, 100_000, 0)
+            )
+            output = io.StringIO()
+            with (
+                patch("ths_stock_picker.cli._import_public_quotes", return_value=0),
+                patch("ths_stock_picker.cli._select_universe_symbols", return_value=("test", ["600000"])),
+                patch("ths_stock_picker.cli._export", return_value=0) as export_mock,
+                redirect_stdout(output),
+            ):
+                self.assertEqual(
+                    main(
+                        [
+                            "--db",
+                            str(db),
+                            "--ths-root",
+                            str(ths_root),
+                            "run-daily",
+                            "--tdx-root",
+                            str(tdx_root),
+                        ]
+                    ),
+                    0,
+                )
+            exported_tables = export_mock.call_args.args[2]
+
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                bars = repo.daily_bars_for_symbol("600000")
+                run = repo.daily_runs(limit=1)[0]
+                health = repo.daily_bar_health()
+                daily_runs_html = render_daily_runs_page(repo)
+            finally:
+                repo.close()
+
+        summary = json.loads(run["summary_json"])
+        parameters = json.loads(run["parameters_json"])
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(bars[0]["trade_date"], "2026-07-09")
+        self.assertEqual(health["sources"][0]["source_kind"], "tdx_unadjusted")
+        self.assertEqual(summary["tdx_daily_bars_imported"], 1)
+        self.assertEqual(summary["tdx_daily_files"], 1)
+        self.assertEqual(summary["daily_bar_health"]["latest_trade_date"], "2026-07-09")
+        self.assertIn(summary["daily_bar_health"]["freshness_status"], {"current", "lagging", "unknown"})
+        self.assertEqual(summary["quote_health"]["freshness_status"], "empty")
+        self.assertEqual(summary["ai_snapshot_status"], "empty")
+        self.assertEqual(summary["ai_decisions_saved"], 0)
+        self.assertEqual(summary["daily_audit_export_tables"], exported_tables)
+        self.assertNotIn("daily_bars", exported_tables)
+        self.assertIn("scores", exported_tables)
+        self.assertEqual(parameters["tdx_root"], str(tdx_root))
+        self.assertIn("Step 1/8: importing TongDaXin local daily bars", output.getvalue())
+        self.assertIn("TDX 同步", daily_runs_html)
+        self.assertIn("日线时效", daily_runs_html)
+        self.assertIn("行情时效", daily_runs_html)
+        self.assertIn("AI 快照", daily_runs_html)
+        self.assertIn("2026-07-09", daily_runs_html)
+
+    def test_run_daily_saves_ai_snapshot_and_tolerates_ai_errors(self) -> None:
+        decision = AIDecision(
+            symbol="600000",
+            name="浦发银行",
+            board="沪主板",
+            decision="观察",
+            confidence=72.0,
+            summary="测试观点",
+            strengths=["测试正向证据"],
+            risks=["测试风险"],
+            trigger_conditions=["测试触发条件"],
+            invalidation_conditions=["测试失效条件"],
+            next_actions=["测试动作"],
+            evidence={},
+        )
+        scenarios = [
+            ("saved", {"return_value": [decision]}, 1),
+            ("failed", {"side_effect": RuntimeError("AI unavailable")}, 0),
+        ]
+        for expected_status, rank_patch, expected_rows in scenarios:
+            with self.subTest(status=expected_status), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                db = root / "picker.db"
+                ths_root = make_fake_ths(root)
+                output = io.StringIO()
+                with (
+                    patch("ths_stock_picker.cli._import_public_quotes", return_value=0),
+                    patch("ths_stock_picker.cli._select_universe_symbols", return_value=("test", [])),
+                    patch("ths_stock_picker.cli._export", return_value=0),
+                    patch("ths_stock_picker.cli.rank_candidates", **rank_patch),
+                    redirect_stdout(output),
+                ):
+                    self.assertEqual(
+                        main(
+                            [
+                                "--db",
+                                str(db),
+                                "--ths-root",
+                                str(ths_root),
+                                "run-daily",
+                                "--limit",
+                                "1",
+                                "--out-dir",
+                                str(root / "outputs"),
+                            ]
+                        ),
+                        0,
+                    )
+
+                repo = Repository(db)
+                try:
+                    repo.init_schema()
+                    summary = json.loads(repo.daily_runs(limit=1)[0]["summary_json"])
+                    rows = repo.latest_ai_decisions(limit=5)
+                finally:
+                    repo.close()
+
+                self.assertEqual(summary["ai_snapshot_status"], expected_status)
+                self.assertEqual(summary["ai_decisions_saved"], expected_rows)
+                self.assertEqual(len(rows), expected_rows)
+                if expected_status == "failed":
+                    self.assertIn("RuntimeError: AI unavailable", summary["ai_snapshot_error"])
+                    self.assertIn("AI snapshot skipped", output.getvalue())
+
+    def test_run_daily_failure_is_recorded_and_listed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "missing-ths"
+            db = Path(temp_dir) / "picker.db"
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(main(["--db", str(db), "--ths-root", str(root), "run-daily"]), 2)
+
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                rows = repo.daily_runs(limit=5)
+            finally:
+                repo.close()
+
+            listed = io.StringIO()
+            with redirect_stdout(listed):
+                self.assertEqual(main(["--db", str(db), "daily-runs", "--limit", "5"]), 0)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "failed")
+        self.assertIn("import_local_cache", json.loads(rows[0]["summary_json"])["failed_step"])
+        self.assertIn("status=failed", listed.getvalue())
+
+    def test_daily_runs_web_page_renders_saved_pipeline_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                run_id = repo.start_daily_run({"limit": 200, "universe": "auto"})
+                repo.finish_daily_run(
+                    run_id,
+                    status="succeeded",
+                    summary={
+                        "history_bars_imported": 120,
+                        "history_symbols": 2,
+                        "tdx_covered_symbols": 2,
+                        "quote_health": {"freshness_status": "empty", "priced_symbols": 0},
+                    },
+                )
+                html = render_daily_runs_page(repo)
+            finally:
+                repo.close()
+
+        self.assertIn("每日运行记录", html)
+        self.assertIn("TDX 已覆盖", html)
+        self.assertIn("行情时效", html)
+        self.assertIn("succeeded", html)
+        self.assertIn("120", html)
+
     def test_factor_scan_and_backtest_use_daily_bars(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db = Path(temp_dir) / "picker.db"
@@ -61,9 +912,33 @@ class StorageCliTests(unittest.TestCase):
                         )
                     )
                 repo.upsert_daily_bars(bars)
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000300",
+                            trade_date=f"2026-06-{day:02d}",
+                            open=100 + day * 0.1,
+                            high=100 + day * 0.1 + 0.2,
+                            low=100 + day * 0.1 - 0.2,
+                            close=100 + day * 0.1,
+                            volume=100_000_000 + day,
+                            amount=None,
+                            source_file=Path("benchmark"),
+                        )
+                        for day in range(1, 46)
+                    ]
+                )
                 signals = repo.factor_scan(symbols=["000001"])
                 backtest = repo.factor_backtest(horizon_days=3)
                 matrix = repo.factor_backtest_matrix(horizons=[3, 5])
+                strategy = repo.strategy_backtest(
+                    horizon_days=3,
+                    top_n=3,
+                    min_signal_score=1,
+                    cost_bps=10,
+                    slippage_bps=5,
+                    benchmark_symbol="000300",
+                )
             finally:
                 repo.close()
 
@@ -72,6 +947,55 @@ class StorageCliTests(unittest.TestCase):
             self.assertIn("samples", backtest[0])
             self.assertTrue(matrix)
             self.assertIn("effectiveness_score", matrix[0])
+            self.assertGreater(strategy["trade_count"], 0)
+            self.assertIn("win_rate", strategy)
+            self.assertIn("max_drawdown", strategy)
+            self.assertIn("equity_curve", strategy)
+            self.assertIn("gross_avg_return", strategy)
+            self.assertAlmostEqual(strategy["round_trip_cost_pct"], 0.3)
+            self.assertLess(strategy["avg_return"], strategy["gross_avg_return"])
+            self.assertIsNotNone(strategy["benchmark"])
+            self.assertGreater(strategy["benchmark"]["sample_count"], 0)
+            self.assertIsNotNone(strategy["excess_portfolio_avg_return"])
+
+    def test_rps_factor_scan_uses_cross_sectional_returns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                bars = []
+                shapes = {
+                    "000001": 1.8,
+                    "000002": 1.1,
+                    "000003": 0.8,
+                }
+                for symbol, multiplier in shapes.items():
+                    for day in range(1, 132):
+                        trade_date = (datetime(2026, 1, 1) + timedelta(days=day - 1)).strftime("%Y-%m-%d")
+                        close = 10.0 * (1 + (multiplier - 1) * day / 131)
+                        bars.append(
+                            DailyBar(
+                                symbol=symbol,
+                                trade_date=trade_date,
+                                open=close,
+                                high=close + 0.1,
+                                low=close - 0.1,
+                                close=close,
+                                volume=1_000_000 + day,
+                                amount=None,
+                                source_file=Path("test"),
+                            )
+                        )
+                repo.upsert_daily_bars(bars)
+                rows = repo.factor_scan(limit=20, symbols=list(shapes))
+            finally:
+                repo.close()
+
+            strong = [row for row in rows if row["symbol"] == "000001" and row["factor_id"] == "rps_60_strength"]
+            weak = [row for row in rows if row["symbol"] == "000003" and row["factor_id"] == "rps_60_weakness"]
+            self.assertTrue(strong)
+            self.assertTrue(weak)
 
     def test_factor_cli_and_web_page_render(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -95,13 +1019,55 @@ class StorageCliTests(unittest.TestCase):
                         for day in range(1, 46)
                     ]
                 )
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000300",
+                            trade_date=f"2026-07-{day:02d}",
+                            open=100 + day * 0.1,
+                            high=100 + day * 0.1 + 0.2,
+                            low=100 + day * 0.1 - 0.2,
+                            close=100 + day * 0.1,
+                            volume=100_000_000 + day,
+                            amount=None,
+                            source_file=Path("benchmark"),
+                        )
+                        for day in range(1, 46)
+                    ]
+                )
                 html = render_factors_page(repo)
+                detail_html = render_factor_detail_page(repo, "ma_multi_breakout")
+                backtest_html = render_backtest_page(
+                    repo,
+                    horizon=3,
+                    top_n=3,
+                    min_signal_score=1,
+                    cost_bps=10,
+                    slippage_bps=5,
+                    benchmark_symbol="000300",
+                )
             finally:
                 repo.close()
 
             self.assertIn("公式因子", html)
             self.assertIn("因子定义", html)
             self.assertIn("因子多周期回测矩阵", html)
+            self.assertIn("/factors/ma_multi_breakout", html)
+            self.assertIn("因子详情", detail_html)
+            self.assertIn("均线共振突破", detail_html)
+            self.assertIn("未来函数风险", detail_html)
+            self.assertIn("当前命中", detail_html)
+            self.assertIn("多周期历史表现", detail_html)
+            self.assertIn("策略回测", backtest_html)
+            self.assertIn("策略交易样本", backtest_html)
+            self.assertIn("组合权益曲线", backtest_html)
+            self.assertIn("最大回撤", backtest_html)
+            self.assertIn("成本 bps", backtest_html)
+            self.assertIn("净收益", backtest_html)
+            self.assertIn("基准 000300", backtest_html)
+            self.assertIn("超额日均", backtest_html)
+            self.assertIn("年度批次表现", backtest_html)
+            self.assertIn("月度批次表现", backtest_html)
 
             output = io.StringIO()
             with redirect_stdout(output):
@@ -112,6 +1078,203 @@ class StorageCliTests(unittest.TestCase):
             with redirect_stdout(output):
                 self.assertEqual(main(["--db", str(db), "factor-matrix", "--horizons", "3,5"]), 0)
             self.assertIn("Factor matrix", output.getvalue())
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    main(
+                        [
+                            "--db",
+                            str(db),
+                            "strategy-backtest",
+                            "--horizon",
+                            "3",
+                            "--top-n",
+                            "3",
+                            "--min-signal-score",
+                            "1",
+                            "--cost-bps",
+                            "10",
+                            "--slippage-bps",
+                            "5",
+                            "--benchmark-symbol",
+                            "000300",
+                            "--save",
+                        ]
+                    ),
+                    0,
+                )
+            self.assertIn("Strategy backtest", output.getvalue())
+            self.assertIn("net_avg", output.getvalue())
+            self.assertIn("benchmark=000300", output.getvalue())
+            self.assertIn("saved_backtest_run=", output.getvalue())
+
+            repo = Repository(db)
+            try:
+                saved_runs = repo.strategy_backtest_runs(limit=5)
+                saved_detail_html = render_strategy_backtest_run_detail_page(repo, int(saved_runs[0]["id"]))
+            finally:
+                repo.close()
+            self.assertEqual(len(saved_runs), 1)
+            self.assertIn("策略回测记录", saved_detail_html)
+            self.assertIn("策略交易样本", saved_detail_html)
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(main(["--db", str(db), "strategy-backtest-runs", "--limit", "5"]), 0)
+            self.assertIn("trades=", output.getvalue())
+
+    def test_factor_matrix_cache_invalidates_when_daily_bars_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date=f"2026-06-{day:02d}",
+                            open=10 + day * 0.04,
+                            high=10 + day * 0.04 + 0.1,
+                            low=10 + day * 0.04 - 0.1,
+                            close=10 + day * 0.04,
+                            volume=10_000_000 + day,
+                            amount=None,
+                            source_file=Path("test"),
+                        )
+                        for day in range(1, 46)
+                    ]
+                )
+                initial = repo.factor_backtest_matrix(horizons=[3], max_bars=45, use_cache=True)
+                self.assertTrue(initial)
+                self.assertEqual(repo.table_counts()["factor_backtest_cache"], 1)
+
+                cache_key = repo._factor_backtest_cache_key([3], None, 45)
+                stale_rows = [{"factor_id": "stale", "horizons": {"3": {"samples": 1}}}]
+                with repo.conn:
+                    repo.conn.execute(
+                        "UPDATE factor_backtest_cache SET rows_json = ? WHERE cache_key = ?",
+                        (json.dumps(stale_rows), cache_key),
+                    )
+                cached = repo.factor_backtest_matrix(horizons=[3], max_bars=45, use_cache=True)
+                self.assertEqual(cached[0]["factor_id"], "stale")
+                self.assertIn(3, cached[0]["horizons"])
+
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date="2026-07-16",
+                            open=12.0,
+                            high=12.3,
+                            low=11.8,
+                            close=12.2,
+                            volume=11_000_000,
+                            amount=None,
+                            source_file=Path("test"),
+                        )
+                    ]
+                )
+                fresh = repo.factor_backtest_matrix(horizons=[3], max_bars=45, use_cache=True)
+            finally:
+                repo.close()
+
+            self.assertTrue(fresh)
+            self.assertNotEqual(fresh[0]["factor_id"], "stale")
+
+    def test_factor_scan_cache_invalidates_when_daily_bars_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date=f"2026-06-{day:02d}",
+                            open=10 + day * 0.04,
+                            high=10 + day * 0.04 + 0.1,
+                            low=10 + day * 0.04 - 0.1,
+                            close=10 + day * 0.04,
+                            volume=10_000_000 + day,
+                            amount=None,
+                            source_file=Path("test"),
+                        )
+                        for day in range(1, 46)
+                    ]
+                )
+                initial = repo.factor_scan(limit=20, symbols=["000001"], use_cache=True)
+                self.assertTrue(initial)
+                self.assertEqual(repo.table_counts()["factor_scan_cache"], 1)
+
+                cache_key = repo._factor_scan_cache_key(20, ["000001"])
+                stale_rows = [{"symbol": "stale", "factor_id": "stale"}]
+                with repo.conn:
+                    repo.conn.execute(
+                        "UPDATE factor_scan_cache SET rows_json = ? WHERE cache_key = ?",
+                        (json.dumps(stale_rows), cache_key),
+                    )
+                cached = repo.factor_scan(limit=20, symbols=["000001"], use_cache=True)
+                self.assertEqual(cached[0]["factor_id"], "stale")
+
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date="2026-07-16",
+                            open=12.0,
+                            high=12.3,
+                            low=11.8,
+                            close=12.2,
+                            volume=11_000_000,
+                            amount=None,
+                            source_file=Path("test"),
+                        )
+                    ]
+                )
+                fresh = repo.factor_scan(limit=20, symbols=["000001"], use_cache=True)
+            finally:
+                repo.close()
+
+            self.assertTrue(fresh)
+            self.assertNotEqual(fresh[0]["factor_id"], "stale")
+
+    def test_factor_scan_auto_cache_skips_universe_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date=f"2026-06-{day:02d}",
+                            open=10 + day * 0.04,
+                            high=10 + day * 0.04 + 0.1,
+                            low=10 + day * 0.04 - 0.1,
+                            close=10 + day * 0.04,
+                            volume=10_000_000 + day,
+                            amount=None,
+                            source_file=Path("test"),
+                        )
+                        for day in range(1, 46)
+                    ]
+                )
+                initial = repo.factor_scan(limit=20, use_cache=True)
+
+                def unexpected_universe_lookup(*_args: object, **_kwargs: object) -> list[str]:
+                    raise AssertionError("cached factor scan should not rebuild the automatic universe")
+
+                repo.symbols_with_daily_bars = unexpected_universe_lookup  # type: ignore[method-assign]
+                cached = repo.factor_scan(limit=20, use_cache=True)
+            finally:
+                repo.close()
+
+            self.assertTrue(initial)
+            self.assertEqual(cached, initial)
 
     def test_ths_monitor_reports_realtime_cache_freshness(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -288,6 +1451,44 @@ class StorageCliTests(unittest.TestCase):
             finally:
                 repo.close()
             self.assertEqual(counts["daily_bars"], 1)
+
+    def test_import_tdx_history_cli_populates_daily_bars(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tdx_root = root / "tdx"
+            lday_dir = tdx_root / "vipdoc" / "sh" / "lday"
+            lday_dir.mkdir(parents=True)
+            (lday_dir / "sh600000.day").write_bytes(
+                struct.pack("IIIIIfII", 20260708, 897, 901, 887, 900, 131376013.0, 14700900, 0)
+            )
+            db = root / "picker.db"
+            output = io.StringIO()
+
+            with redirect_stdout(output):
+                self.assertEqual(
+                    main(
+                        [
+                            "--db",
+                            str(db),
+                            "import-tdx-history",
+                            "600000",
+                            "--tdx-root",
+                            str(tdx_root),
+                            "--replace-existing",
+                        ]
+                    ),
+                    0,
+                )
+
+            self.assertIn("TDX daily bars: 1", output.getvalue())
+            repo = Repository(db)
+            try:
+                rows = repo.recent_daily_bars("600000", limit=5)
+            finally:
+                repo.close()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["trade_date"], "2026-07-08")
+            self.assertEqual(rows[0]["close"], 9.0)
 
     def test_public_quotes_enable_scoring(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -613,6 +1814,151 @@ class StorageCliTests(unittest.TestCase):
             self.assertIn("trend_ma20", components)
             self.assertIn("momentum_20d", components)
 
+    def test_scores_cli_handles_saved_scores_without_current_quote_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                with repo.conn:
+                    score_run = repo.conn.execute(
+                        "INSERT INTO score_runs (score_date, profile_name, profile_json) VALUES (?, ?, ?)",
+                        ("2026-07-08", "default", "{}"),
+                    )
+                    repo.conn.execute(
+                        """
+                        INSERT INTO scores
+                            (score_run_id, score_date, symbol, profile_name, total_score, components_json, triggered_rules_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (score_run.lastrowid, "2026-07-08", "600000", "default", 66.0, "{}", "[]"),
+                    )
+                coverage = repo.latest_score_quote_coverage()
+                ai_html = render_ai_page(repo)
+                dashboard_html = render_dashboard(repo)
+            finally:
+                repo.close()
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(main(["--db", str(db), "scores", "--positive-only"]), 0)
+
+        self.assertIn("600000", output.getvalue())
+        self.assertIn("pct=-", output.getvalue())
+        self.assertEqual(coverage["score_count"], 1)
+        self.assertEqual(coverage["priced_score_count"], 0)
+        self.assertIn("AI 候选暂不可用", ai_html)
+        self.assertIn("带价格行情 0 / 1", ai_html)
+        self.assertIn("AI 候选暂不可用", dashboard_html)
+
+    def test_local_quote_import_preserves_public_prices_for_scoring(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_public_quotes(
+                    [
+                        QuoteObservation(
+                            symbol="600000",
+                            name="浦发银行",
+                            latest_price=12.0,
+                            pct_change=1.0,
+                            volume=20_000_000,
+                            amount=200_000_000,
+                            open=11.8,
+                            high=12.1,
+                            low=11.7,
+                            previous_close=11.88,
+                            observed_at="2026-07-08 10:52:47",
+                            source="test",
+                            market_cap=100_000_000_000,
+                            turnover_rate=1.0,
+                            board="沪主板",
+                        )
+                    ]
+                )
+                repo.insert_quotes(
+                    [
+                        QuoteRealtime(
+                            symbol="600000",
+                            name="浦发银行",
+                            market="shase",
+                            latest_price=None,
+                            pct_change=None,
+                            volume=None,
+                            amount=None,
+                            observed_at="2026-07-09 09:31:00",
+                            quote_status="code_only",
+                        )
+                    ]
+                )
+                score_count = repo.score_latest_quotes()
+                quote = repo.latest_quote_for_symbol("600000")
+                candidates = repo.latest_candidates(limit=5, min_score=1)
+                coverage = repo.latest_score_quote_coverage()
+            finally:
+                repo.close()
+
+        self.assertIsNotNone(quote)
+        self.assertEqual(quote["latest_price"], 12.0)
+        self.assertEqual(score_count, 1)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["latest_price"], 12.0)
+        self.assertEqual(coverage["score_count"], 1)
+        self.assertEqual(coverage["priced_score_count"], 1)
+
+    def test_public_quote_refresh_keeps_previous_symbols_when_request_is_partial(self) -> None:
+        def observation(symbol: str, name: str, price: float, observed_at: str) -> QuoteObservation:
+            return QuoteObservation(
+                symbol=symbol,
+                name=name,
+                latest_price=price,
+                pct_change=1.0,
+                volume=20_000_000,
+                amount=200_000_000,
+                open=price - 0.2,
+                high=price + 0.1,
+                low=price - 0.3,
+                previous_close=price - 0.12,
+                observed_at=observed_at,
+                source="test",
+                market_cap=100_000_000_000,
+                turnover_rate=1.0,
+                board="沪主板",
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_public_quotes(
+                    [
+                        observation("600000", "浦发银行", 12.0, "2026-07-08 10:52:47"),
+                        observation("000001", "平安银行", 10.0, "2026-07-08 10:52:47"),
+                    ]
+                )
+                refreshed = repo.upsert_public_quotes(
+                    [observation("600000", "浦发银行", 12.5, "2026-07-09 10:52:47")]
+                )
+                empty_refresh = repo.upsert_public_quotes([])
+                first_quote = repo.latest_quote_for_symbol("600000")
+                second_quote = repo.latest_quote_for_symbol("000001")
+                public_count = repo.conn.execute(
+                    "SELECT COUNT(*) AS count FROM quotes_realtime WHERE quote_status = 'public_quote'"
+                ).fetchone()["count"]
+                score_count = repo.score_latest_quotes()
+            finally:
+                repo.close()
+
+        self.assertEqual(refreshed, 1)
+        self.assertEqual(empty_refresh, 0)
+        self.assertEqual(public_count, 2)
+        self.assertEqual(first_quote["latest_price"], 12.5)
+        self.assertEqual(second_quote["latest_price"], 10.0)
+        self.assertEqual(score_count, 2)
+
     def test_ai_decision_generates_symbol_thesis_and_can_be_saved(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db = Path(temp_dir) / "picker.db"
@@ -661,6 +2007,7 @@ class StorageCliTests(unittest.TestCase):
                 decision = analyze_symbol(repo, "688981")
                 ranked = rank_candidates(repo, limit=5)
                 html = render_ai_page(repo)
+                detail_html = render_symbol_detail(repo, "688981")
             finally:
                 repo.close()
 
@@ -668,15 +2015,23 @@ class StorageCliTests(unittest.TestCase):
             assert decision is not None
             self.assertIn(decision.decision, {"重点观察", "观察", "等待回踩", "谨慎复盘", "回避"})
             self.assertIn("中芯国际", decision.summary)
+            self.assertTrue(decision.trigger_conditions)
+            self.assertTrue(decision.invalidation_conditions)
             self.assertEqual(ranked[0].symbol, "688981")
             self.assertIn("AI 选股", html)
             self.assertIn("AI 候选观点", html)
             self.assertIn("公式因子", html)
+            self.assertIn("/notes/quick-add", html)
+            self.assertIn("加入观察", html)
+            self.assertIn("触发条件", detail_html)
+            self.assertIn("失效条件", detail_html)
 
             output = io.StringIO()
             with redirect_stdout(output):
                 self.assertEqual(main(["--db", str(db), "ai-explain", "688981", "--save"]), 0)
             self.assertIn("中芯国际", output.getvalue())
+            self.assertIn("Trigger conditions:", output.getvalue())
+            self.assertIn("Invalidation conditions:", output.getvalue())
             repo = Repository(db)
             try:
                 rows = repo.latest_ai_decisions(5)
@@ -712,6 +2067,9 @@ class StorageCliTests(unittest.TestCase):
                 repo.close()
             self.assertEqual(rows[0]["symbol"], "688981")
             self.assertEqual(filtered[0]["symbol"], "688981")
+            saved_thesis = json.loads(rows[0]["thesis_json"])
+            self.assertIn("trigger_conditions", saved_thesis)
+            self.assertIn("invalidation_conditions", saved_thesis)
             self.assertIn("AI 历史", history_html)
             self.assertIn("中芯国际", history_html)
             self.assertEqual(changes[0]["status"], "changed")
@@ -727,6 +2085,126 @@ class StorageCliTests(unittest.TestCase):
             with redirect_stdout(output):
                 self.assertEqual(main(["--db", str(db), "ai-changes"]), 0)
             self.assertIn("changed", output.getvalue())
+
+    def test_ai_decision_outcomes_use_next_open_and_keep_incomplete_observations_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="600000",
+                            trade_date=trade_date,
+                            open=open_price,
+                            high=close_price + 0.2,
+                            low=open_price - 0.2,
+                            close=close_price,
+                            volume=1_000_000,
+                            amount=None,
+                            source_file=Path("tdx://lday/sh/sh600000.day"),
+                        )
+                        for trade_date, open_price, close_price in [
+                            ("2026-01-01", 9.5, 10.0),
+                            ("2026-01-02", 10.0, 10.5),
+                            ("2026-01-03", 10.5, 11.0),
+                            ("2026-01-04", 11.0, 12.0),
+                        ]
+                    ]
+                )
+                repo.insert_ai_decisions(
+                    [
+                        {
+                            "symbol": "600000",
+                            "name": "浦发银行",
+                            "decision": "观察",
+                            "confidence": 70.0,
+                            "summary": "已到期观点",
+                            "thesis_json": json.dumps({"evidence": {"score_date": "2026-01-01"}}),
+                        },
+                        {
+                            "symbol": "000001",
+                            "name": "平安银行",
+                            "decision": "观察",
+                            "confidence": 65.0,
+                            "summary": "尚未到期观点",
+                            "thesis_json": json.dumps({"evidence": {"score_date": "2026-01-05"}}),
+                        },
+                    ]
+                )
+                repo.insert_ai_decisions(
+                    [
+                        {
+                            "symbol": "600000",
+                            "name": "浦发银行",
+                            "decision": "重点观察",
+                            "confidence": 88.0,
+                            "summary": "同日较新观点",
+                            "thesis_json": json.dumps({"evidence": {"score_date": "2026-01-01"}}),
+                        }
+                    ]
+                )
+                outcomes = repo.ai_decision_outcomes(limit=10, horizon_days=3)
+                outcomes_by_symbol = {str(row["symbol"]): row for row in outcomes}
+                outcome_summary = summarize_ai_decision_outcomes(outcomes)
+                outcomes_html = render_ai_outcomes_page(repo, limit=10, horizon=3)
+            finally:
+                repo.close()
+
+            evaluated = outcomes_by_symbol["600000"]
+            pending = outcomes_by_symbol["000001"]
+            self.assertEqual(len(outcomes), 2)
+            self.assertEqual(evaluated["entry_date"], "2026-01-02")
+            self.assertEqual(evaluated["decision"], "重点观察")
+            self.assertEqual(evaluated["entry_price"], 10.0)
+            self.assertEqual(evaluated["exit_date"], "2026-01-04")
+            self.assertEqual(evaluated["exit_price"], 12.0)
+            self.assertAlmostEqual(float(evaluated["return_pct"]), 20.0)
+            self.assertEqual(evaluated["status"], "evaluated")
+            self.assertEqual(pending["status"], "pending")
+            self.assertEqual(pending["status_label"], "待下一交易日")
+            self.assertEqual(outcome_summary["evaluated"], 1)
+            self.assertEqual(outcome_summary["pending"], 1)
+            self.assertEqual(outcome_summary["positive"], 1)
+            self.assertAlmostEqual(float(outcome_summary["hit_rate"]), 100.0)
+            self.assertAlmostEqual(float(outcome_summary["average_return"]), 20.0)
+            self.assertIn("AI 观点复盘", outcomes_html)
+            self.assertIn("按保存结论汇总", outcomes_html)
+            self.assertIn("已完成", outcomes_html)
+            self.assertIn("待下一交易日", outcomes_html)
+
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.insert_ai_decisions(
+                    [
+                        {
+                            "symbol": "600000",
+                            "name": "浦发银行",
+                            "decision": "观察",
+                            "confidence": 72.0,
+                            "summary": "同日替换观点",
+                            "thesis_json": json.dumps({"evidence": {"score_date": "2026-01-01"}}),
+                        }
+                    ],
+                    replace_same_signal=True,
+                )
+                same_day_rows = [
+                    row
+                    for row in repo.latest_ai_decisions(limit=10, symbol="600000")
+                    if json.loads(row["thesis_json"])["evidence"]["score_date"] == "2026-01-01"
+                ]
+            finally:
+                repo.close()
+            self.assertEqual(len(same_day_rows), 1)
+            self.assertEqual(same_day_rows[0]["summary"], "同日替换观点")
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(main(["--db", str(db), "ai-outcomes", "--limit", "10", "--horizon", "3"]), 0)
+            self.assertIn("600000", output.getvalue())
+            self.assertIn("outcome=+20.00%", output.getvalue())
 
     def test_explain_cli_prints_score_breakdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

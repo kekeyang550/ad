@@ -18,10 +18,27 @@ from .history_import import fetch_tencent_daily_bars, load_daily_bars_csv
 from .news_import import load_default_ths_news
 from .quote_observer import fetch_tencent_observations, write_observations_csv
 from .scoring_profile import load_scoring_profile, write_default_scoring_profile
-from .storage import DEFAULT_DB_PATH, Repository
+from .storage import DEFAULT_DB_PATH, Repository, summarize_ai_decision_outcomes
 from .ths_local import DEFAULT_THS_ROOT, THSLocalAdapter
 from .ths_monitor import inspect_ths_source
+from .tdx_local import DEFAULT_TDX_ROOT, inspect_tdx_daily_status, load_tdx_daily_bars
+from .time_utils import display_shanghai_time
 from .web_panel import serve_dashboard
+
+
+DAILY_AUDIT_EXPORT_TABLES = [
+    "securities",
+    "market_snapshots",
+    "quotes_realtime",
+    "watchlists",
+    "scores",
+    "score_runs",
+    "stock_notes",
+    "ai_decisions",
+    "news_items",
+    "strategy_validation_runs",
+    "daily_runs",
+]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -41,12 +58,86 @@ def main(argv: list[str] | None = None) -> int:
     factor_scan_parser = subparsers.add_parser("factor-scan", help="Scan latest daily bars for formula-inspired factor signals.")
     factor_scan_parser.add_argument("--limit", type=int, default=50)
     factor_scan_parser.add_argument("--symbol", action="append", default=None)
+    factor_scan_cache_parser = subparsers.add_parser("refresh-factor-scan-cache", help="Rebuild cached latest factor signals.")
+    factor_scan_cache_parser.add_argument("--limit", type=int, default=50)
+    factor_scan_cache_parser.add_argument("--symbol", action="append", default=None)
     factor_backtest_parser = subparsers.add_parser("factor-backtest", help="Backtest formula-inspired factors on stored daily bars.")
     factor_backtest_parser.add_argument("--horizon", type=int, default=5)
     factor_backtest_parser.add_argument("--limit-symbols", type=int)
     factor_matrix_parser = subparsers.add_parser("factor-matrix", help="Show multi-horizon factor effectiveness.")
     factor_matrix_parser.add_argument("--horizons", default="3,5,10")
     factor_matrix_parser.add_argument("--limit-symbols", type=int)
+    factor_matrix_parser.add_argument("--max-bars", type=int, default=0, help="Recent bars per symbol to use. Pass 0 for all history.")
+    factor_cache_parser = subparsers.add_parser("refresh-factor-cache", help="Rebuild cached multi-horizon factor effectiveness.")
+    factor_cache_parser.add_argument("--horizons", default="3,5,10")
+    factor_cache_parser.add_argument("--limit-symbols", type=int, default=30)
+    factor_cache_parser.add_argument("--max-bars", type=int, default=150, help="Recent bars per symbol to use. Pass 0 for all history.")
+    strategy_backtest_parser = subparsers.add_parser("strategy-backtest", help="Backtest a factor-composite stock-picking strategy.")
+    strategy_backtest_parser.add_argument("--horizon", type=int, default=5)
+    strategy_backtest_parser.add_argument("--top-n", type=int, default=10)
+    strategy_backtest_parser.add_argument("--min-signal-score", type=float, default=60.0)
+    strategy_backtest_parser.add_argument("--limit-symbols", type=int)
+    strategy_backtest_parser.add_argument("--cost-bps", type=float, default=0.0, help="One-way transaction cost in basis points.")
+    strategy_backtest_parser.add_argument("--slippage-bps", type=float, default=0.0, help="One-way slippage assumption in basis points.")
+    strategy_backtest_parser.add_argument("--benchmark-symbol", help="Optional benchmark symbol with stored daily bars, such as sh000300.")
+    strategy_backtest_parser.add_argument("--max-bars", type=int, default=260, help="Recent bars per symbol to use. Pass 0 for all history.")
+    strategy_backtest_parser.add_argument(
+        "--execution",
+        choices=["next_open", "signal_close"],
+        default="next_open",
+        help="Entry timing. next_open avoids using the signal-day close as an executable price.",
+    )
+    strategy_backtest_parser.add_argument(
+        "--position-mode",
+        choices=["non_overlapping", "daily_batches"],
+        default="non_overlapping",
+        help="non_overlapping waits for a batch to exit before the next entry; daily_batches is research-only overlapping cohorts.",
+    )
+    strategy_backtest_parser.add_argument("--save", action="store_true", help="Save the parameters and result as a local research record.")
+    strategy_backtest_runs_parser = subparsers.add_parser(
+        "strategy-backtest-runs",
+        help="List saved strategy backtest records.",
+    )
+    strategy_backtest_runs_parser.add_argument("--limit", type=int, default=20)
+    walk_forward_parser = subparsers.add_parser("strategy-walkforward", help="Run rolling out-of-sample strategy validation.")
+    walk_forward_parser.add_argument("--train-days", type=int, default=252)
+    walk_forward_parser.add_argument("--test-days", type=int, default=63)
+    walk_forward_parser.add_argument("--max-folds", type=int)
+    walk_forward_parser.add_argument("--horizon", type=int, default=5)
+    walk_forward_parser.add_argument("--top-n", type=int, default=10)
+    walk_forward_parser.add_argument("--min-signal-score", type=float, default=60.0)
+    walk_forward_parser.add_argument("--limit-symbols", type=int)
+    walk_forward_parser.add_argument("--cost-bps", type=float, default=0.0)
+    walk_forward_parser.add_argument("--slippage-bps", type=float, default=0.0)
+    walk_forward_parser.add_argument("--benchmark-symbol")
+    walk_forward_parser.add_argument("--execution", choices=["next_open", "signal_close"], default="next_open")
+    walk_forward_parser.add_argument("--position-mode", choices=["non_overlapping", "daily_batches"], default="non_overlapping")
+    strategy_validate_parser = subparsers.add_parser(
+        "strategy-validate",
+        help="Run, assess, and save rolling out-of-sample strategy validation.",
+    )
+    strategy_validate_parser.add_argument("--train-days", type=int, default=252)
+    strategy_validate_parser.add_argument("--test-days", type=int, default=63)
+    strategy_validate_parser.add_argument("--max-folds", type=int)
+    strategy_validate_parser.add_argument("--horizon", type=int, default=5)
+    strategy_validate_parser.add_argument("--top-n", type=int, default=10)
+    strategy_validate_parser.add_argument("--min-signal-score", type=float, default=60.0)
+    strategy_validate_parser.add_argument("--limit-symbols", type=int)
+    strategy_validate_parser.add_argument("--cost-bps", type=float, default=0.0)
+    strategy_validate_parser.add_argument("--slippage-bps", type=float, default=0.0)
+    strategy_validate_parser.add_argument("--benchmark-symbol")
+    strategy_validate_parser.add_argument("--execution", choices=["next_open", "signal_close"], default="next_open")
+    strategy_validate_parser.add_argument("--position-mode", choices=["non_overlapping", "daily_batches"], default="non_overlapping")
+    strategy_validate_parser.add_argument("--min-folds", type=int, default=3)
+    strategy_validate_parser.add_argument("--min-trades", type=int, default=60)
+    strategy_validate_parser.add_argument("--min-positive-fold-ratio", type=float, default=0.6)
+    strategy_validate_parser.add_argument("--max-drawdown", type=float, default=-20.0)
+    strategy_validate_parser.add_argument("--min-benchmark-excess-return", type=float, default=0.0)
+    strategy_validation_runs_parser = subparsers.add_parser(
+        "strategy-validation-runs",
+        help="List saved walk-forward strategy validation conclusions.",
+    )
+    strategy_validation_runs_parser.add_argument("--limit", type=int, default=20)
     subparsers.add_parser("import", help="Import read-only local cache metadata into SQLite.")
     score_parser = subparsers.add_parser("score", help="Score parsed realtime quotes when fields are available.")
     score_parser.add_argument("--profile", type=Path, help="Optional JSON scoring profile.")
@@ -89,6 +180,10 @@ def main(argv: list[str] | None = None) -> int:
     ai_history_parser.add_argument("--symbol")
     ai_changes_parser = subparsers.add_parser("ai-changes", help="Compare latest saved AI decisions per symbol.")
     ai_changes_parser.add_argument("--limit", type=int, default=50)
+    ai_outcomes_parser = subparsers.add_parser("ai-outcomes", help="Review forward daily-bar performance for saved AI decisions.")
+    ai_outcomes_parser.add_argument("--limit", type=int, default=50)
+    ai_outcomes_parser.add_argument("--horizon", type=int, default=5)
+    ai_outcomes_parser.add_argument("--symbol")
     candidates_parser = subparsers.add_parser("candidates", help="Export and show filtered stock candidates.")
     candidates_parser.add_argument("--limit", type=int, default=50)
     candidates_parser.add_argument("--min-score", type=float, default=1.0)
@@ -98,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
     report_parser.add_argument("--min-score", type=float, default=1.0)
     report_parser.add_argument("--out", type=Path, default=Path("outputs/daily_report.md"))
     subparsers.add_parser("db-info", help="Show SQLite table counts.")
+    subparsers.add_parser("data-health", help="Show daily-bar source coverage and source conflicts.")
     snapshots_parser = subparsers.add_parser("snapshots", help="Show latest snapshot diagnostics.")
     snapshots_parser.add_argument("--limit", type=int, default=20)
     export_parser = subparsers.add_parser("export", help="Export SQLite tables to CSV files.")
@@ -110,7 +206,22 @@ def main(argv: list[str] | None = None) -> int:
     export_parser.add_argument(
                 "--table",
         action="append",
-        choices=["securities", "market_snapshots", "quotes_realtime", "watchlists", "scores", "score_runs", "daily_bars", "stock_notes", "ai_decisions", "news_items"],
+        choices=[
+            "securities",
+            "market_snapshots",
+            "quotes_realtime",
+            "watchlists",
+            "scores",
+            "score_runs",
+            "daily_bars",
+            "stock_notes",
+            "ai_decisions",
+            "news_items",
+            "factor_backtest_cache",
+            "strategy_validation_runs",
+            "strategy_backtest_runs",
+            "daily_runs",
+        ],
         help="Table to export. Can be passed multiple times. Defaults to all tables.",
     )
     inspect_parser = subparsers.add_parser(
@@ -171,6 +282,27 @@ def main(argv: list[str] | None = None) -> int:
     public_history_parser.add_argument("--universe", choices=["auto", "watchlist", "securities", "cache"])
     public_history_parser.add_argument("--limit", type=int, default=100)
     public_history_parser.add_argument("--days", type=int, default=80)
+    tdx_history_parser = subparsers.add_parser(
+        "import-tdx-history",
+        help="Import local TongDaXin .day daily bars into SQLite.",
+    )
+    tdx_history_parser.add_argument("symbols", nargs="*", help="Optional 6-digit symbols to import.")
+    tdx_history_parser.add_argument("--tdx-root", type=Path, default=DEFAULT_TDX_ROOT)
+    tdx_history_parser.add_argument(
+        "--include-indices",
+        action="store_true",
+        help="Also import recognized broad and industry index .day files.",
+    )
+    tdx_history_parser.add_argument("--limit-symbols", type=int)
+    tdx_history_parser.add_argument("--start-date", default="", help="YYYY-MM-DD lower bound.")
+    tdx_history_parser.add_argument("--end-date", default="", help="YYYY-MM-DD upper bound.")
+    tdx_history_parser.add_argument(
+        "--replace-existing",
+        action="store_true",
+        help="Delete existing daily_bars for imported symbols before inserting TDX bars.",
+    )
+    tdx_status_parser = subparsers.add_parser("tdx-status", help="Inspect local TDX stock and index daily-bar freshness.")
+    tdx_status_parser.add_argument("--tdx-root", type=Path, default=DEFAULT_TDX_ROOT)
     observe_parser = subparsers.add_parser(
         "auto-observe",
         help="Fetch public quote observations for selected symbols.",
@@ -202,6 +334,15 @@ def main(argv: list[str] | None = None) -> int:
     daily_parser.add_argument("--universe", choices=["auto", "watchlist", "securities", "cache"], default="auto")
     daily_parser.add_argument("--history-days", type=int, default=80)
     daily_parser.add_argument("--profile", type=Path, help="Optional JSON scoring profile.")
+    daily_parser.add_argument("--tdx-root", type=Path, help="Optional local TongDaXin root for daily-bar synchronization.")
+    daily_parser.add_argument("--tdx-include-indices", action="store_true", help="Also synchronize recognized TDX indices.")
+    daily_parser.add_argument(
+        "--tdx-start-date",
+        default="",
+        help="Optional inclusive TDX start date (YYYY-MM-DD). Defaults to the latest stored TDX date.",
+    )
+    daily_runs_parser = subparsers.add_parser("daily-runs", help="List saved daily pipeline runs and failures.")
+    daily_runs_parser.add_argument("--limit", type=int, default=20)
     serve_parser = subparsers.add_parser("serve", help="Start a read-only local web dashboard.")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8765)
@@ -233,10 +374,37 @@ def main(argv: list[str] | None = None) -> int:
             return _factors()
         if args.command == "factor-scan":
             return _factor_scan(repo, args.limit, args.symbol)
+        if args.command == "refresh-factor-scan-cache":
+            return _refresh_factor_scan_cache(repo, args.limit, args.symbol)
         if args.command == "factor-backtest":
             return _factor_backtest(repo, args.horizon, args.limit_symbols)
         if args.command == "factor-matrix":
-            return _factor_matrix(repo, args.horizons, args.limit_symbols)
+            return _factor_matrix(repo, args.horizons, args.limit_symbols, args.max_bars)
+        if args.command == "refresh-factor-cache":
+            return _refresh_factor_cache(repo, args.horizons, args.limit_symbols, args.max_bars)
+        if args.command == "strategy-backtest":
+            return _strategy_backtest(
+                repo,
+                args.horizon,
+                args.top_n,
+                args.min_signal_score,
+                args.limit_symbols,
+                args.cost_bps,
+                args.slippage_bps,
+                args.benchmark_symbol,
+                args.max_bars,
+                args.execution,
+                args.position_mode,
+                args.save,
+            )
+        if args.command == "strategy-backtest-runs":
+            return _strategy_backtest_runs(repo, args.limit)
+        if args.command == "strategy-walkforward":
+            return _strategy_walk_forward(repo, args)
+        if args.command == "strategy-validate":
+            return _strategy_validate(repo, args)
+        if args.command == "strategy-validation-runs":
+            return _strategy_validation_runs(repo, args.limit)
         if args.command == "import":
             return _import(adapter, repo)
         if args.command == "score":
@@ -265,12 +433,16 @@ def main(argv: list[str] | None = None) -> int:
             return _ai_history(repo, args.limit, args.symbol)
         if args.command == "ai-changes":
             return _ai_changes(repo, args.limit)
+        if args.command == "ai-outcomes":
+            return _ai_outcomes(repo, args.limit, args.horizon, args.symbol)
         if args.command == "candidates":
             return _candidates(repo, args.limit, args.min_score, args.out)
         if args.command == "report":
             return _report(repo, args.limit, args.min_score, args.out)
         if args.command == "db-info":
             return _db_info(repo)
+        if args.command == "data-health":
+            return _data_health(repo)
         if args.command == "snapshots":
             return _snapshots(repo, args.limit)
         if args.command == "export":
@@ -295,6 +467,19 @@ def main(argv: list[str] | None = None) -> int:
             return _import_history(repo, args.files, args.symbol)
         if args.command == "import-public-history":
             return _import_public_history(repo, args.symbols, args.universe, args.limit, args.days)
+        if args.command == "import-tdx-history":
+            return _import_tdx_history(
+                repo,
+                args.tdx_root,
+                args.symbols,
+                args.include_indices,
+                args.limit_symbols,
+                args.start_date,
+                args.end_date,
+                args.replace_existing,
+            )
+        if args.command == "tdx-status":
+            return _tdx_status(args.tdx_root)
         if args.command == "auto-observe":
             return _auto_observe(args.symbols, args.out)
         if args.command == "import-public-quotes":
@@ -302,7 +487,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "universe":
             return _universe(repo, args.source, args.limit)
         if args.command == "run-daily":
-            return _run_daily(adapter, repo, args.limit, args.out_dir, args.universe, args.history_days, args.profile)
+            return _run_daily(
+                adapter,
+                repo,
+                args.limit,
+                args.out_dir,
+                args.universe,
+                args.history_days,
+                args.profile,
+                args.tdx_root,
+                args.tdx_include_indices,
+                args.tdx_start_date,
+            )
+        if args.command == "daily-runs":
+            return _daily_runs(repo, args.limit)
         if args.command == "serve":
             repo.close()
             serve_dashboard(args.db, host=args.host, port=args.port, limit=args.limit, ths_root=args.ths_root)
@@ -386,7 +584,7 @@ def _factors() -> int:
 
 
 def _factor_scan(repo: Repository, limit: int, symbols: list[str] | None) -> int:
-    rows = repo.factor_scan(limit=limit, symbols=symbols)
+    rows = repo.factor_scan(limit=limit, symbols=symbols, use_cache=True)
     if not rows:
         print("No factor signals found. Import enough daily bars first.")
         return 0
@@ -396,6 +594,12 @@ def _factor_scan(repo: Repository, limit: int, symbols: list[str] | None) -> int
             f"{row['direction']} strength={float(row['strength']):.1f}"
         )
         print(f"   {row['reason']}")
+    return 0
+
+
+def _refresh_factor_scan_cache(repo: Repository, limit: int, symbols: list[str] | None) -> int:
+    rows = repo.refresh_factor_scan_cache(limit=limit, symbols=symbols)
+    print(f"Refreshed factor signal cache limit={limit} signals={len(rows)}")
     return 0
 
 
@@ -414,13 +618,17 @@ def _factor_backtest(repo: Repository, horizon: int, limit_symbols: int | None) 
     return 0
 
 
-def _factor_matrix(repo: Repository, horizons_text: str, limit_symbols: int | None) -> int:
+def _factor_matrix(repo: Repository, horizons_text: str, limit_symbols: int | None, max_bars: int = 0) -> int:
     horizons = _parse_horizons(horizons_text)
-    rows = repo.factor_backtest_matrix(horizons=horizons, limit_symbols=limit_symbols)
+    selected_max_bars = None if max_bars <= 0 else max_bars
+    rows = repo.factor_backtest_matrix(horizons=horizons, limit_symbols=limit_symbols, max_bars=selected_max_bars, use_cache=True)
     if not rows:
         print("No factor matrix samples found. Import more historical daily bars first.")
         return 0
-    print(f"Factor matrix horizons={','.join(str(item) for item in horizons)}")
+    print(
+        f"Factor matrix horizons={','.join(str(item) for item in horizons)} "
+        f"limit_symbols={limit_symbols or 'all'} max_bars={'all' if selected_max_bars is None else selected_max_bars}"
+    )
     for row in rows:
         parts = []
         horizon_stats = row["horizons"]
@@ -436,6 +644,236 @@ def _factor_matrix(repo: Repository, horizons_text: str, limit_symbols: int | No
             f"{row['factor_id']} {row['factor_name']} verdict={row['verdict']} "
             f"score={float(row['effectiveness_score']):.1f} samples={row['total_samples']} | "
             + " | ".join(parts)
+        )
+    return 0
+
+
+def _refresh_factor_cache(repo: Repository, horizons_text: str, limit_symbols: int | None, max_bars: int) -> int:
+    horizons = _parse_horizons(horizons_text)
+    selected_max_bars = None if max_bars <= 0 else max_bars
+    rows = repo.refresh_factor_backtest_cache(horizons=horizons, limit_symbols=limit_symbols, max_bars=selected_max_bars)
+    print(
+        f"Refreshed factor cache horizons={','.join(str(item) for item in horizons)} "
+        f"limit_symbols={limit_symbols or 'all'} max_bars={'all' if selected_max_bars is None else selected_max_bars} "
+        f"factors={len(rows)}"
+    )
+    return 0
+
+
+def _strategy_backtest(
+    repo: Repository,
+    horizon: int,
+    top_n: int,
+    min_signal_score: float,
+    limit_symbols: int | None,
+    cost_bps: float,
+    slippage_bps: float,
+    benchmark_symbol: str | None,
+    max_bars: int,
+    execution_mode: str,
+    position_mode: str,
+    save: bool = False,
+) -> int:
+    selected_max_bars = None if max_bars <= 0 else max_bars
+    result = repo.strategy_backtest(
+        horizon_days=horizon,
+        top_n=top_n,
+        min_signal_score=min_signal_score,
+        limit_symbols=limit_symbols,
+        cost_bps=cost_bps,
+        slippage_bps=slippage_bps,
+        benchmark_symbol=benchmark_symbol,
+        max_bars=selected_max_bars,
+        execution_mode=execution_mode,
+        position_mode=position_mode,
+    )
+    parameters: dict[str, object] = {
+        "horizon_days": horizon,
+        "top_n": top_n,
+        "min_signal_score": min_signal_score,
+        "limit_symbols": limit_symbols,
+        "cost_bps": cost_bps,
+        "slippage_bps": slippage_bps,
+        "benchmark_symbol": benchmark_symbol,
+        "max_bars": selected_max_bars,
+        "execution_mode": execution_mode,
+        "position_mode": position_mode,
+    }
+    print(
+        f"Strategy backtest horizon={horizon} top_n={top_n} min_signal_score={min_signal_score:g} "
+        f"cost_bps={cost_bps:g} slippage_bps={slippage_bps:g} "
+        f"execution={execution_mode} "
+        f"position_mode={position_mode} "
+        f"max_bars={'all' if selected_max_bars is None else selected_max_bars} "
+        f"trades={result['trade_count']} days={result['day_count']}"
+    )
+    print(
+        f"locked_limit_skipped entries={result.get('skipped_locked_entries', 0)} "
+        f"exits={result.get('skipped_locked_exits', 0)}"
+    )
+    saved_run_id = repo.save_strategy_backtest_run(parameters, result) if save else None
+    if int(result["trade_count"]) == 0:
+        print("No strategy trades found. Import more daily bars or lower min-signal-score.")
+        if saved_run_id is not None:
+            print(f"saved_backtest_run={saved_run_id}")
+        return 0
+    print(
+        f"win_rate={float(result['win_rate']):.1f}% net_avg={float(result['avg_return']):.2f}% "
+        f"gross_avg={float(result.get('gross_avg_return') or 0.0):.2f}% "
+        f"net_portfolio_avg={float(result['portfolio_avg_return']):.2f}% "
+        f"max_dd={float(result['max_drawdown']):.2f}% "
+        f"best={float(result['best_return']):.2f}% worst={float(result['worst_return']):.2f}%"
+    )
+    benchmark = result.get("benchmark")
+    if isinstance(benchmark, dict) and int(benchmark.get("sample_count") or 0) > 0:
+        excess = result.get("excess_portfolio_avg_return")
+        print(
+            f"benchmark={benchmark['symbol']} samples={benchmark['sample_count']} "
+            f"avg={float(benchmark['avg_return']):.2f}% cumulative={float(benchmark['cumulative_return']):.2f}% "
+            f"max_dd={float(benchmark['max_drawdown']):.2f}% "
+            f"excess_portfolio_avg={float(excess):.2f}%"
+        )
+    elif isinstance(benchmark, dict):
+        print(f"benchmark={benchmark['symbol']} samples=0 (import matching daily bars first)")
+    period_stats = result.get("period_stats", {})
+    if isinstance(period_stats, dict):
+        for row in period_stats.get("yearly", []):
+            print(
+                f"year={row['period']} batches={row['batches']} trades={row['trades']} "
+                f"batch_win={float(row['win_rate']):.1f}% net_avg={float(row['avg_return']):.2f}% "
+                f"cumulative={float(row['cumulative_return']):.2f}% max_dd={float(row['max_drawdown']):.2f}%"
+            )
+        for row in list(period_stats.get("monthly", []))[-12:]:
+            print(
+                f"month={row['period']} batches={row['batches']} trades={row['trades']} "
+                f"batch_win={float(row['win_rate']):.1f}% net_avg={float(row['avg_return']):.2f}% "
+                f"cumulative={float(row['cumulative_return']):.2f}% max_dd={float(row['max_drawdown']):.2f}%"
+            )
+    for row in result["trades"][:20]:
+        print(
+            f"signal={row.get('signal_date', row['trade_date'])} entry={row['trade_date']}->{row['exit_date']} "
+            f"{row['symbol']} {row['name'] or '-'} "
+            f"score={float(row['signal_score']):.1f} net={float(row['return_pct']):.2f}% "
+            f"gross={float(row.get('gross_return_pct', row['return_pct'])):.2f}% factors={row['factors']}"
+        )
+    if saved_run_id is not None:
+        print(f"saved_backtest_run={saved_run_id}")
+    return 0
+
+
+def _strategy_walk_forward(repo: Repository, args: argparse.Namespace) -> int:
+    result = repo.strategy_walk_forward(
+        train_days=args.train_days,
+        test_days=args.test_days,
+        max_folds=args.max_folds,
+        horizon_days=args.horizon,
+        top_n=args.top_n,
+        min_signal_score=args.min_signal_score,
+        limit_symbols=args.limit_symbols,
+        cost_bps=args.cost_bps,
+        slippage_bps=args.slippage_bps,
+        benchmark_symbol=args.benchmark_symbol,
+        execution_mode=args.execution,
+        position_mode=args.position_mode,
+    )
+    _print_strategy_walk_forward(result)
+    return 0
+
+
+def _strategy_validate(repo: Repository, args: argparse.Namespace) -> int:
+    parameters: dict[str, object] = {
+        "train_days": args.train_days,
+        "test_days": args.test_days,
+        "max_folds": args.max_folds,
+        "horizon_days": args.horizon,
+        "top_n": args.top_n,
+        "min_signal_score": args.min_signal_score,
+        "limit_symbols": args.limit_symbols,
+        "cost_bps": args.cost_bps,
+        "slippage_bps": args.slippage_bps,
+        "benchmark_symbol": args.benchmark_symbol,
+        "execution_mode": args.execution,
+        "position_mode": args.position_mode,
+        "min_folds": args.min_folds,
+        "min_trades": args.min_trades,
+        "min_positive_fold_ratio": args.min_positive_fold_ratio,
+        "max_drawdown": args.max_drawdown,
+        "min_benchmark_excess_return": args.min_benchmark_excess_return,
+    }
+    result = repo.validate_strategy_walk_forward(
+        train_days=args.train_days,
+        test_days=args.test_days,
+        max_folds=args.max_folds,
+        horizon_days=args.horizon,
+        top_n=args.top_n,
+        min_signal_score=args.min_signal_score,
+        limit_symbols=args.limit_symbols,
+        cost_bps=args.cost_bps,
+        slippage_bps=args.slippage_bps,
+        benchmark_symbol=args.benchmark_symbol,
+        execution_mode=args.execution,
+        position_mode=args.position_mode,
+        min_folds=args.min_folds,
+        min_trades=args.min_trades,
+        min_positive_fold_ratio=args.min_positive_fold_ratio,
+        max_drawdown=args.max_drawdown,
+        min_benchmark_excess_return=args.min_benchmark_excess_return,
+    )
+    _print_strategy_walk_forward(result)
+    assessment = result["assessment"]
+    print(f"validation_verdict={assessment['verdict']} {assessment['summary']}")
+    for reason in assessment["reasons"]:
+        print(f"reason={reason}")
+    run_id = repo.save_strategy_validation_run(parameters, result, assessment)
+    print(f"saved_validation_run={run_id}")
+    return 0
+
+
+def _print_strategy_walk_forward(result: dict[str, object]) -> None:
+    print(
+        f"Walk-forward train_days={result['train_days']} test_days={result['test_days']} "
+        f"folds={len(result['folds'])} test_batches={result['total_test_days']} trades={result['total_trades']}"
+    )
+    for row in result["folds"]:
+        print(
+            f"fold={row['fold']} train={row['train_start_date']}..{row['train_end_date']} "
+            f"test={row['test_start_date']}..{row['test_end_date']} batches={row['test_days']} "
+            f"trades={row['trade_count']} net_avg={float(row['avg_return']):.2f}% "
+            f"portfolio_avg={float(row['portfolio_avg_return']):.2f}% max_dd={float(row['max_drawdown']):.2f}%"
+        )
+
+
+def _strategy_validation_runs(repo: Repository, limit: int) -> int:
+    rows = repo.strategy_validation_runs(limit=limit)
+    if not rows:
+        print("No saved strategy validation runs.")
+        return 0
+    for row in rows:
+        print(
+            f"id={row['id']} run_at={display_shanghai_time(row['run_at'])} verdict={row['verdict']} "
+            f"data={row['data_fingerprint']} summary={row['summary']}"
+        )
+    return 0
+
+
+def _strategy_backtest_runs(repo: Repository, limit: int) -> int:
+    rows = repo.strategy_backtest_runs(limit=limit)
+    if not rows:
+        print("No saved strategy backtest runs.")
+        return 0
+    for row in rows:
+        try:
+            summary = json.loads(str(row["summary_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            summary = {}
+        if not isinstance(summary, dict):
+            summary = {}
+        print(
+            f"id={row['id']} run_at={display_shanghai_time(row['run_at'])} "
+            f"trades={int(summary.get('trade_count') or 0)} "
+            f"portfolio_avg={_fmt_number(summary.get('portfolio_avg_return'))}% "
+            f"max_dd={_fmt_number(summary.get('max_drawdown'))}% "
+            f"data={row['data_fingerprint']}"
         )
     return 0
 
@@ -509,12 +947,13 @@ def _scores(repo: Repository, limit: int, positive_only: bool = False) -> int:
         print("No scores found. Run score after importing quotes.")
         return 0
     for row in rows:
+        market_cap = row["market_cap"]
+        market_cap_text = "-" if market_cap is None else f"{float(market_cap) / 100000000:.2f}亿"
         print(
             f"{row['symbol']} {row['name'] or '-'} {row['board'] or '-'} "
-            f"score={row['total_score']:.2f} price={row['latest_price']} "
-            f"pct={row['pct_change']:.2f}% amount={row['amount']} "
-            f"mcap={((row['market_cap'] or 0) / 100000000):.2f}亿 "
-            f"turnover={(row['turnover_rate'] or 0):.2f}%"
+            f"score={_fmt_number(row['total_score'])} price={_fmt_number(row['latest_price'])} "
+            f"pct={_fmt_number(row['pct_change'])}% amount={_fmt_number(row['amount'], 0)} "
+            f"mcap={market_cap_text} turnover={_fmt_number(row['turnover_rate'])}%"
         )
     return 0
 
@@ -604,7 +1043,7 @@ def _notes(repo: Repository, limit: int, status: str | None = None, query: str =
         print(
             f"{row['symbol']} {row['name'] or '-'} {row['status']} "
             f"score={_fmt_number(row['total_score'])} price={_fmt_number(row['latest_price'])} "
-            f"tags={row['tags'] or '-'} note={row['note'] or '-'} updated_at={row['updated_at']}"
+            f"tags={row['tags'] or '-'} note={row['note'] or '-'} updated_at={display_shanghai_time(row['updated_at'])}"
         )
     return 0
 
@@ -621,7 +1060,16 @@ def _delete_note(repo: Repository, symbol: str) -> int:
 def _ai_pick(repo: Repository, limit: int, min_score: float, save: bool) -> int:
     decisions = rank_candidates(repo, limit=limit, min_score=min_score)
     if not decisions:
-        print("No AI candidates found. Run run-daily or score first.")
+        coverage = repo.latest_score_quote_coverage()
+        score_count = int(coverage["score_count"])
+        priced_score_count = int(coverage["priced_score_count"])
+        if score_count and priced_score_count == 0:
+            print(
+                f"No AI candidates found: latest score batch has {score_count} scores but "
+                f"0 price-ready quotes (score_date={coverage['score_date'] or '-'})."
+            )
+        else:
+            print("No AI candidates found. Run run-daily or score first.")
         return 0
     if save:
         repo.insert_ai_decisions(decisions_to_rows(decisions))
@@ -649,6 +1097,12 @@ def _ai_explain(repo: Repository, symbol: str, save: bool) -> int:
     print("Risks:")
     for item in decision.risks:
         print(f"- {item}")
+    print("Trigger conditions:")
+    for item in decision.trigger_conditions:
+        print(f"- {item}")
+    print("Invalidation conditions:")
+    for item in decision.invalidation_conditions:
+        print(f"- {item}")
     print("Next actions:")
     for item in decision.next_actions:
         print(f"- {item}")
@@ -664,7 +1118,7 @@ def _ai_history(repo: Repository, limit: int, symbol: str | None) -> int:
         return 0
     for row in rows:
         print(
-            f"#{row['id']} {row['run_at']} {row['symbol']} {row['name'] or '-'} "
+            f"#{row['id']} {display_shanghai_time(row['run_at'])} {row['symbol']} {row['name'] or '-'} "
             f"{row['decision']} confidence={row['confidence']:.0f}"
         )
         print(f"   {row['summary']}")
@@ -688,6 +1142,38 @@ def _ai_changes(repo: Repository, limit: int) -> int:
     return 0
 
 
+def _ai_outcomes(repo: Repository, limit: int, horizon: int, symbol: str | None) -> int:
+    selected_symbol = symbol if symbol and len(symbol) == 6 and symbol.isdigit() else None
+    rows = repo.ai_decision_outcomes(limit=limit, horizon_days=horizon, symbol=selected_symbol)
+    if not rows:
+        print("No saved AI decisions found. Run run-daily or ai-pick --save first.")
+        return 0
+    summary = summarize_ai_decision_outcomes(rows)
+    hit_rate = summary["hit_rate"]
+    average_return = summary["average_return"]
+    print(
+        f"AI outcomes: total={summary['total']} completed={summary['evaluated']} "
+        f"pending={summary['pending']} unavailable={summary['unavailable']} "
+        f"positive={summary['positive']} "
+        f"hit_rate={'-' if hit_rate is None else f'{float(hit_rate):.1f}%'} "
+        f"average_return={'-' if average_return is None else f'{float(average_return):+.2f}%'}"
+    )
+    for row in rows:
+        entry = "-" if row["entry_date"] is None else f"{row['entry_date']}@{float(row['entry_price']):.2f}"
+        if row["status"] == "evaluated":
+            exit_text = f"{row['exit_date']}@{float(row['exit_price']):.2f}"
+            outcome = f"{float(row['return_pct']):+.2f}%"
+        else:
+            exit_text = "-"
+            outcome = str(row["status_label"])
+        print(
+            f"#{row['id']} {row['symbol']} {row['name'] or '-'} {row['decision']} "
+            f"signal={row['score_date'] or '-'} horizon={row['horizon_days']}d "
+            f"entry={entry} exit={exit_text} outcome={outcome}"
+        )
+    return 0
+
+
 def _fmt_number(value: object, digits: int = 2) -> str:
     if value is None:
         return "-"
@@ -699,12 +1185,13 @@ def _candidates(repo: Repository, limit: int, min_score: float, out: Path) -> in
     rows = repo.latest_candidates(limit=limit, min_score=min_score)
     print(f"Wrote {count} candidates -> {out}")
     for row in rows[:20]:
+        market_cap = row["market_cap"]
+        market_cap_text = "-" if market_cap is None else f"{float(market_cap) / 100000000:.2f}亿"
         print(
             f"{row['symbol']} {row['name'] or '-'} {row['board'] or '-'} "
-            f"score={row['total_score']:.2f} price={row['latest_price']} "
-            f"pct={row['pct_change']:.2f}% amount={row['amount']} "
-            f"mcap={((row['market_cap'] or 0) / 100000000):.2f}亿 "
-            f"turnover={(row['turnover_rate'] or 0):.2f}%"
+            f"score={_fmt_number(row['total_score'])} price={_fmt_number(row['latest_price'])} "
+            f"pct={_fmt_number(row['pct_change'])}% amount={_fmt_number(row['amount'], 0)} "
+            f"mcap={market_cap_text} turnover={_fmt_number(row['turnover_rate'])}%"
         )
     return 0
 
@@ -718,6 +1205,27 @@ def _report(repo: Repository, limit: int, min_score: float, out: Path) -> int:
 def _db_info(repo: Repository) -> int:
     for table, count in repo.table_counts().items():
         print(f"{table}: {count}")
+    return 0
+
+
+def _data_health(repo: Repository) -> int:
+    health = repo.daily_bar_health()
+    print(f"Daily bar health: {health['status']}")
+    print(f"Canonical source precedence: {health['canonical_source_policy']}")
+    print(f"Bars: {health['total_bars']}  Symbols: {health['total_symbols']}")
+    print(f"Duplicate symbol-days: {health['duplicate_symbol_days']}  Rows in conflicts: {health['duplicate_rows']}")
+    print(
+        f"Freshness: {health['freshness_status']} latest_trade_date={health['latest_trade_date'] or '-'} "
+        f"weekday_lag_days={health['weekday_lag_days'] if health['weekday_lag_days'] is not None else '-'} "
+        f"checked_on={health['freshness_checked_on']}"
+    )
+    if health.get("latest_any_trade_date") != health.get("latest_trade_date"):
+        print(f"Latest non-stock-or-any daily bar: {health['latest_any_trade_date'] or '-'}")
+    for row in health["sources"]:
+        print(
+            f"{row['source_kind']}: bars={row['bars']} symbols={row['symbols']} "
+            f"range={row['first_trade_date'] or '-'}..{row['last_trade_date'] or '-'}"
+        )
     return 0
 
 
@@ -736,7 +1244,21 @@ def _snapshots(repo: Repository, limit: int) -> int:
 
 
 def _export(repo: Repository, out_dir: Path, tables: list[str] | None) -> int:
-    selected = tables or ["securities", "market_snapshots", "quotes_realtime", "watchlists", "scores", "score_runs", "daily_bars", "stock_notes", "ai_decisions", "news_items"]
+    selected = tables or [
+        "securities",
+        "market_snapshots",
+        "quotes_realtime",
+        "watchlists",
+        "scores",
+        "score_runs",
+        "daily_bars",
+        "stock_notes",
+        "ai_decisions",
+        "news_items",
+        "strategy_validation_runs",
+        "strategy_backtest_runs",
+        "daily_runs",
+    ]
     for table in selected:
         output_path = out_dir / f"{table}.csv"
         count = repo.export_table_csv(table, output_path)
@@ -877,6 +1399,56 @@ def _import_public_history(
     return 0 if imported else 1
 
 
+def _import_tdx_history(
+    repo: Repository,
+    tdx_root: Path,
+    symbols: list[str],
+    include_indices: bool,
+    limit_symbols: int | None,
+    start_date: str,
+    end_date: str,
+    replace_existing: bool,
+) -> int:
+    bars, files = load_tdx_daily_bars(
+        tdx_root=tdx_root,
+        symbols=symbols,
+        include_indices=include_indices,
+        limit_symbols=limit_symbols,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if not files:
+        print(f"No TDX .day files found under {tdx_root}.")
+        return 1
+    imported_symbols = sorted({item.symbol for item in files})
+    deleted = repo.delete_daily_bars_for_symbols(imported_symbols) if replace_existing else 0
+    imported = repo.upsert_daily_bars(bars)
+    first_date = min((bar.trade_date for bar in bars), default="-")
+    last_date = max((bar.trade_date for bar in bars), default="-")
+    print(f"TDX root: {tdx_root}")
+    print(f"TDX daily files: {len(files)} symbols={len(imported_symbols)}")
+    print(f"TDX daily bars: {len(bars)} date_range={first_date}->{last_date}")
+    if replace_existing:
+        print(f"Deleted existing daily bars: {deleted}")
+    print(f"Imported daily bars: {imported}")
+    return 0 if imported else 1
+
+
+def _tdx_status(tdx_root: Path) -> int:
+    status = inspect_tdx_daily_status(tdx_root)
+    print(f"TDX root: {status.root}")
+    print(
+        f"stock_files={status.stock_file_count} "
+        f"stock_latest_trade_date={status.stock_latest_trade_date or '-'}"
+    )
+    print(
+        f"index_files={status.index_file_count} "
+        f"index_latest_trade_date={status.index_latest_trade_date or '-'}"
+    )
+    print(f"latest_trade_date={status.latest_trade_date or '-'}")
+    return 0 if status.stock_file_count or status.index_file_count else 1
+
+
 def _auto_observe(symbols: list[str], out: Path) -> int:
     observations = fetch_tencent_observations(symbols)
     write_observations_csv(out, observations)
@@ -978,34 +1550,231 @@ def _run_daily(
     universe: str,
     history_days: int,
     profile_path: Path | None = None,
+    tdx_root: Path | None = None,
+    tdx_include_indices: bool = False,
+    tdx_start_date: str = "",
 ) -> int:
-    print("Step 1/6: importing TongHuaShun local cache")
-    import_code = _import(adapter, repo)
-    if import_code != 0:
-        return import_code
+    parameters = {
+        "limit": limit,
+        "out_dir": str(out_dir),
+        "universe": universe,
+        "history_days": history_days,
+        "profile": str(profile_path) if profile_path is not None else None,
+        "tdx_root": str(tdx_root) if tdx_root is not None else None,
+        "tdx_include_indices": tdx_include_indices,
+        "tdx_start_date": tdx_start_date or None,
+    }
+    run_id = repo.start_daily_run(parameters)
+    summary: dict[str, object] = {"run_id": run_id}
+    total_steps = 8 if tdx_root is not None else 7
+    next_step = 1
+    current_step = "import_tdx_history" if tdx_root is not None else "import_local_cache"
+    try:
+        if tdx_root is not None:
+            print(f"Step {next_step}/{total_steps}: importing TongDaXin local daily bars")
+            tdx_code, tdx_summary = _sync_tdx_daily_bars(repo, tdx_root, tdx_include_indices, tdx_start_date)
+            summary.update(tdx_summary)
+            if tdx_code != 0:
+                summary.update({"failed_step": current_step, "return_code": tdx_code})
+                repo.finish_daily_run(run_id, "failed", summary, f"{current_step} returned {tdx_code}")
+                return tdx_code
+            next_step += 1
 
-    print("Step 2/6: importing TongHuaShun local news")
-    _import_ths_news(repo, adapter.root, limit_per_file=300)
+        current_step = "import_local_cache"
+        print(f"Step {next_step}/{total_steps}: importing TongHuaShun local cache")
+        import_code = _import(adapter, repo)
+        if import_code != 0:
+            summary.update({"failed_step": current_step, "return_code": import_code})
+            repo.finish_daily_run(run_id, "failed", summary, f"{current_step} returned {import_code}")
+            return import_code
 
-    print("Step 3/6: fetching public quote supplement")
-    observations_path = out_dir / "observations_public.csv"
-    quote_code = _import_public_quotes(repo, [], from_cache=False, universe=universe, limit=limit, observations_out=observations_path)
-    if quote_code != 0:
-        return quote_code
+        current_step = "import_local_news"
+        next_step += 1
+        print(f"Step {next_step}/{total_steps}: importing TongHuaShun local news")
+        _import_ths_news(repo, adapter.root, limit_per_file=300)
 
-    print("Step 4/6: fetching public daily bars")
-    source, history_symbols = _select_universe_symbols(repo, universe, limit)
-    print(f"Using {source} universe for history: {len(history_symbols)} symbols")
-    bars = fetch_tencent_daily_bars(history_symbols, count=history_days)
-    repo.upsert_daily_bars(bars)
-    print(f"Imported daily bars: {len(bars)}")
+        current_step = "import_public_quotes"
+        next_step += 1
+        print(f"Step {next_step}/{total_steps}: fetching public quote supplement")
+        observations_path = out_dir / "observations_public.csv"
+        quote_code = _import_public_quotes(repo, [], from_cache=False, universe=universe, limit=limit, observations_out=observations_path)
+        if quote_code != 0:
+            summary.update({"failed_step": current_step, "return_code": quote_code})
+            repo.finish_daily_run(run_id, "failed", summary, f"{current_step} returned {quote_code}")
+            return quote_code
 
-    print("Step 5/6: scoring")
-    _score(repo, profile_path)
-    _scores(repo, min(20, limit), positive_only=True)
+        current_step = "import_public_history"
+        next_step += 1
+        print(f"Step {next_step}/{total_steps}: fetching public daily bars")
+        source, history_symbols = _select_universe_symbols(repo, universe, limit)
+        print(f"Using {source} universe for history: {len(history_symbols)} symbols")
+        public_history_symbols = repo.symbols_without_tdx_daily_bars(history_symbols)
+        tdx_covered_symbols = len(history_symbols) - len(public_history_symbols)
+        if public_history_symbols:
+            bars = fetch_tencent_daily_bars(public_history_symbols, count=history_days)
+            repo.upsert_daily_bars(bars)
+            print(f"Imported daily bars: {len(bars)}")
+        else:
+            bars = []
+            print("Skipped public daily bars: all selected symbols already have TDX history.")
 
-    print("Step 6/6: exporting")
-    _export(repo, out_dir, None)
-    _candidates(repo, min(50, limit), 1.0, out_dir / "candidates.csv")
-    _report(repo, min(20, limit), 1.0, out_dir / "daily_report.md")
+        current_step = "score"
+        next_step += 1
+        print(f"Step {next_step}/{total_steps}: scoring")
+        score_code = _score(repo, profile_path)
+        _scores(repo, min(20, limit), positive_only=True)
+
+        current_step = "save_ai_snapshot"
+        next_step += 1
+        print(f"Step {next_step}/{total_steps}: saving AI snapshot")
+        try:
+            decisions = rank_candidates(repo, limit=min(30, limit), min_score=1.0)
+            saved_ai_decisions = (
+                repo.insert_ai_decisions(decisions_to_rows(decisions), replace_same_signal=True) if decisions else 0
+            )
+            summary.update(
+                {
+                    "ai_snapshot_status": "saved" if saved_ai_decisions else "empty",
+                    "ai_decisions_saved": saved_ai_decisions,
+                }
+            )
+            print(f"Saved AI snapshot decisions: {saved_ai_decisions}")
+        except Exception as error:
+            summary.update(
+                {
+                    "ai_snapshot_status": "failed",
+                    "ai_decisions_saved": 0,
+                    "ai_snapshot_error": f"{type(error).__name__}: {error}",
+                }
+            )
+            print(f"AI snapshot skipped: {type(error).__name__}: {error}")
+
+        current_step = "export"
+        next_step += 1
+        print(f"Step {next_step}/{total_steps}: exporting")
+        _export(repo, out_dir, DAILY_AUDIT_EXPORT_TABLES)
+        candidates_path = out_dir / "candidates.csv"
+        report_path = out_dir / "daily_report.md"
+        _candidates(repo, min(50, limit), 1.0, candidates_path)
+        _report(repo, min(20, limit), 1.0, report_path)
+        health = repo.daily_bar_health()
+        quote_health = repo.quote_health()
+        summary.update(
+            {
+                "universe_source": source,
+                "history_symbols": len(history_symbols),
+                "tdx_covered_symbols": tdx_covered_symbols,
+                "public_history_symbols": len(public_history_symbols),
+                "history_bars_imported": len(bars),
+                "score_return_code": score_code,
+                "daily_audit_export_tables": DAILY_AUDIT_EXPORT_TABLES,
+                "artifacts": [str(observations_path), str(candidates_path), str(report_path)],
+                "table_counts": repo.table_counts(),
+                "daily_bar_health": {
+                    "status": health["status"],
+                    "latest_trade_date": health["latest_trade_date"],
+                    "freshness_status": health["freshness_status"],
+                    "weekday_lag_days": health["weekday_lag_days"],
+                    "freshness_checked_on": health["freshness_checked_on"],
+                },
+                "quote_health": {
+                    "priced_symbols": quote_health["priced_symbols"],
+                    "current_priced_symbols": quote_health["current_priced_symbols"],
+                    "stale_priced_symbols": quote_health["stale_priced_symbols"],
+                    "latest_price_date": quote_health["latest_price_date"],
+                    "freshness_status": quote_health["freshness_status"],
+                    "weekday_lag_days": quote_health["weekday_lag_days"],
+                    "freshness_checked_on": quote_health["freshness_checked_on"],
+                },
+            }
+        )
+        repo.finish_daily_run(run_id, "succeeded", summary)
+        print(f"Saved daily run: {run_id}")
+        return 0
+    except Exception as error:
+        summary["failed_step"] = current_step
+        repo.finish_daily_run(run_id, "failed", summary, f"{type(error).__name__}: {error}")
+        raise
+
+
+def _sync_tdx_daily_bars(
+    repo: Repository,
+    tdx_root: Path,
+    include_indices: bool,
+    requested_start_date: str,
+) -> tuple[int, dict[str, object]]:
+    existing_tdx_date = next(
+        (
+            str(source["last_trade_date"])
+            for source in repo.daily_bar_health()["sources"]
+            if source["source_kind"] == "tdx_unadjusted" and source["last_trade_date"]
+        ),
+        "",
+    )
+    start_date = requested_start_date or existing_tdx_date
+    bars, files = load_tdx_daily_bars(
+        tdx_root=tdx_root,
+        include_indices=include_indices,
+        start_date=start_date,
+    )
+    summary = {
+        "tdx_root": str(tdx_root),
+        "tdx_include_indices": include_indices,
+        "tdx_start_date": start_date or None,
+        "tdx_daily_files": len(files),
+        "tdx_daily_bars_loaded": len(bars),
+        "tdx_daily_bars_imported": 0,
+    }
+    if not files:
+        print(f"No TDX .day files found under {tdx_root}.")
+        return 1, summary
+    imported = repo.upsert_daily_bars(bars) if bars else 0
+    summary["tdx_daily_bars_imported"] = imported
+    first_date = min((bar.trade_date for bar in bars), default="-")
+    last_date = max((bar.trade_date for bar in bars), default="-")
+    print(
+        f"TDX daily files: {len(files)} bars={len(bars)} imported={imported} "
+        f"date_range={first_date}->{last_date} start_date={start_date or '-'}"
+    )
+    return 0, summary
+
+
+def _daily_runs(repo: Repository, limit: int) -> int:
+    rows = repo.daily_runs(limit=limit)
+    if not rows:
+        print("No saved daily runs.")
+        return 0
+    for row in rows:
+        try:
+            summary = json.loads(row["summary_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            summary = {}
+        detail = ""
+        if isinstance(summary, dict):
+            if row["status"] == "succeeded":
+                health = summary.get("daily_bar_health")
+                freshness = "-"
+                if isinstance(health, dict):
+                    freshness = str(health.get("freshness_status") or "-")
+                quote_health = summary.get("quote_health")
+                quote_freshness = "-"
+                if isinstance(quote_health, dict):
+                    quote_freshness = str(quote_health.get("freshness_status") or "-")
+                ai_snapshot = str(summary.get("ai_snapshot_status") or "-")
+                ai_saved = int(summary.get("ai_decisions_saved") or 0)
+                detail = (
+                    f"history_bars={summary.get('history_bars_imported', 0)} "
+                    f"history_symbols={summary.get('history_symbols', 0)} "
+                    f"tdx_covered={summary.get('tdx_covered_symbols', 0)} "
+                    f"tdx_sync_bars={summary.get('tdx_daily_bars_imported', 0)} "
+                    f"daily_freshness={freshness} quote_freshness={quote_freshness} "
+                    f"ai_snapshot={ai_snapshot}:{ai_saved}"
+                )
+            else:
+                detail = f"failed_step={summary.get('failed_step', '-')}"
+        print(
+            f"id={row['id']} started_at={display_shanghai_time(row['started_at'])} "
+            f"finished_at={display_shanghai_time(row['finished_at']) if row['finished_at'] else '-'} "
+            f"status={row['status']} {detail} error={row['error_text'] or '-'}"
+        )
     return 0

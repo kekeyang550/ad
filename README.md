@@ -32,7 +32,17 @@ python -m ths_stock_picker news --limit 20
 python -m ths_stock_picker news --tag AI算力
 python -m ths_stock_picker factors
 python -m ths_stock_picker factor-scan --limit 20
+python -m ths_stock_picker refresh-factor-scan-cache --limit 20
 python -m ths_stock_picker factor-backtest --horizon 5 --limit-symbols 300
+python -m ths_stock_picker factor-matrix --horizons 3,5,10 --limit-symbols 300 --max-bars 260
+python -m ths_stock_picker refresh-factor-cache --horizons 3,5,10 --limit-symbols 300 --max-bars 260
+python -m ths_stock_picker strategy-backtest --horizon 5 --top-n 10 --min-signal-score 60 --limit-symbols 300 --cost-bps 5 --slippage-bps 5 --benchmark-symbol sh000300 --max-bars 260 --execution next_open --position-mode non_overlapping --save
+python -m ths_stock_picker strategy-backtest-runs --limit 20
+python -m ths_stock_picker strategy-walkforward --train-days 252 --test-days 63 --max-folds 4 --horizon 5 --top-n 10 --min-signal-score 60 --limit-symbols 100 --cost-bps 5 --slippage-bps 5 --benchmark-symbol sh000300
+python -m ths_stock_picker strategy-validate --train-days 252 --test-days 63 --max-folds 4 --horizon 5 --top-n 10 --min-signal-score 60 --limit-symbols 100 --cost-bps 5 --slippage-bps 5 --benchmark-symbol sh000300
+python -m ths_stock_picker strategy-validation-runs --limit 20
+python -m ths_stock_picker import-tdx-history --tdx-root D:\new_tdx --include-indices --replace-existing --limit-symbols 300
+python -m ths_stock_picker tdx-status --tdx-root D:\new_tdx
 python -m ths_stock_picker import
 python -m ths_stock_picker score
 python -m ths_stock_picker score --profile configs\scoring.default.json
@@ -40,6 +50,7 @@ python -m ths_stock_picker score-runs --limit 10
 python -m ths_stock_picker compare-runs --limit 20
 python -m ths_stock_picker write-default-profile --out configs\scoring.default.json
 python -m ths_stock_picker db-info
+python -m ths_stock_picker data-health
 python -m ths_stock_picker snapshots --limit 5
 python -m ths_stock_picker inspect-symbol 600000 --json-out outputs\600000.inspect.json
 python -m ths_stock_picker capture-symbols 600000 000001 600519 --out outputs\capture_baseline.json
@@ -50,7 +61,8 @@ python -m ths_stock_picker import-public-quotes 600000 000001 600519 --observati
 python -m ths_stock_picker import-public-quotes --from-cache --limit 200
 python -m ths_stock_picker import-public-history --universe auto --limit 200 --days 80
 python -m ths_stock_picker universe --source auto --limit 50
-python -m ths_stock_picker run-daily --limit 200 --history-days 80 --profile configs\scoring.default.json --out-dir outputs
+python -m ths_stock_picker run-daily --limit 200 --history-days 80 --profile configs\scoring.default.json --tdx-root D:\new_tdx --tdx-include-indices --out-dir outputs
+python -m ths_stock_picker daily-runs --limit 20
 python -m ths_stock_picker import-history path\to\daily.csv
 python -m ths_stock_picker score
 python -m ths_stock_picker scores --limit 20
@@ -95,19 +107,20 @@ python -m ths_stock_picker --ths-root "D:\同花顺软件\同花顺" --db "work\
 3. 打开同花顺，填入界面显示的现价、涨跌幅、成交量、成交额等字段。
 4. 用 `match-observations` 自动筛选可能的字段偏移和编码方式。
 
-也可以跳过人工填写，使用 `auto-infer-fields` 自动抓取公开行情作为观测值。如果同花顺本地缓存没有可匹配的价格字段，使用 `import-public-quotes` 将公开实时行情作为价格补充源写入 `quotes_realtime`，同花顺本地缓存继续负责证券池、名称、市场和诊断。公开行情补充源当前会写入现价、涨跌幅、成交量、成交额、总市值、流通市值、换手率和板块分类。
+也可以跳过人工填写，使用 `auto-infer-fields` 自动抓取公开行情作为观测值。如果同花顺本地缓存没有可匹配的价格字段，使用 `import-public-quotes` 将公开实时行情作为价格补充源写入 `quotes_realtime`，同花顺本地缓存继续负责证券池、名称、市场和诊断。本地仅代码缓存的重新导入会保留上一批公开价格，避免把可评分行情清空；公开接口临时返回空或部分结果时，也只更新成功返回的代码，保留其余报价等待下次刷新。公开行情补充源当前会写入现价、涨跌幅、成交量、成交额、总市值、流通市值、换手率和板块分类。
 
 ## 每日更新
 
 推荐日常使用：
 
 ```powershell
-python -m ths_stock_picker run-daily --limit 200 --history-days 80 --profile configs\scoring.default.json --out-dir outputs
+python -m ths_stock_picker run-daily --limit 200 --history-days 80 --profile configs\scoring.default.json --tdx-root D:\new_tdx --tdx-include-indices --out-dir outputs
+python -m ths_stock_picker daily-runs --limit 20
 python -m ths_stock_picker scores --limit 20 --positive-only
 python -m ths_stock_picker explain 600000 --bars 8
 ```
 
-`run-daily` 会依次执行同花顺本地缓存导入、公开实时行情补齐、公开日线补齐、评分、CSV 导出、候选池导出和 Markdown 日报生成。
+`run-daily` 会依次执行同花顺本地缓存导入、公开实时行情补齐、公开日线补齐、评分、AI 观点快照、轻量审计 CSV、候选池导出和 Markdown 日报生成。传入 `--tdx-root` 时，会在开始处同步本地通达信日线；首次同步导入全历史，后续默认从已入库 TDX 最新日期开始重叠增量同步，可用 `--tdx-start-date` 覆盖。`--tdx-include-indices` 只会额外同步已识别指数。公共日线补齐会自动跳过已有通达信日线的标的，避免混入腾讯前复权价格造成同日双来源冲突。每日流程不再重复导出全部原始 `daily_bars`；需要完整日线 CSV 时可单独执行 `export --table daily_bars`。AI 快照没有候选或生成异常时会写入运行记录，但不会让数据更新失败。每次运行都会写入 `daily_runs`：成功记录会保存 TDX 同步量、日线导入量、通达信已覆盖数量、股票池数量、输出文件和表计数，以及当次日线和带价格行情的时效快照；失败记录会保存停止步骤、返回码或异常原因。可用 `daily-runs` 或 Web 的 `/daily-runs` 查看最近运行，不必依赖终端滚动日志。
 
 评分器当前包含：流动性、盘中动量、价格区间、盘中位置、市值分层、换手率分层、板块风险、ST/PT/退市名称风险，以及基于日线的 MA5/MA20 趋势、5 日/20 日动量和 20 日波动率。
 
@@ -129,7 +142,9 @@ python -m ths_stock_picker write-default-profile --out configs\scoring.default.j
 python -m ths_stock_picker serve --host 127.0.0.1 --port 8765
 ```
 
-浏览器打开 `http://127.0.0.1:8765/`，可以查看数据表计数、候选池、评分榜、批次变化和同花顺缓存解析诊断。首页支持按代码/名称搜索、按板块筛选、设置最低分、排序和导出当前候选 CSV；`http://127.0.0.1:8765/ths` 可查看同花顺进程和 A 股实时缓存活跃度；`http://127.0.0.1:8765/news` 可查看同花顺本地新闻缓存；`http://127.0.0.1:8765/factors` 可查看公式型因子定义、当前命中和历史回测；`http://127.0.0.1:8765/ai` 会生成 AI 辅助选股榜，并可一键保存本次榜单；`http://127.0.0.1:8765/ai/history` 可查看已保存 AI 历史观点；`http://127.0.0.1:8765/ai/changes` 可查看最近两次 AI 观点的变化；个股详情页包含 AI 观点、相关新闻、本地观察记录、分项分、触发规则、最近日线表和轻量走势 SVG 图。
+浏览器打开 `http://127.0.0.1:8765/`，可以查看数据表计数、候选池、评分榜、批次变化和同花顺缓存解析诊断。首页支持按代码/名称搜索、按板块筛选、设置最低分、排序和导出当前候选 CSV；`http://127.0.0.1:8765/daily-runs` 可复查每日数据更新流水线的成功或失败记录；`http://127.0.0.1:8765/ths` 可查看同花顺进程和 A 股实时缓存活跃度；`http://127.0.0.1:8765/data-health` 可查看日线来源、覆盖范围与同日冲突；`http://127.0.0.1:8765/news` 可查看同花顺本地新闻缓存；`http://127.0.0.1:8765/factors` 可查看公式型因子定义、当前命中和历史回测，`http://127.0.0.1:8765/factors/{factor_id}` 可查看单因子的逻辑、来源、未来函数风险、当前命中与多周期表现；`http://127.0.0.1:8765/backtest` 可用真实日线做组合策略回测并保存本次结果；`http://127.0.0.1:8765/strategy-backtest-runs` 可复查已保存的回测参数、摘要和日线版本；`http://127.0.0.1:8765/strategy-validation` 可复查已保存的滚动样本外结论、参数和数据版本；`http://127.0.0.1:8765/ai` 会生成 AI 辅助选股榜，并可一键保存本次榜单；`http://127.0.0.1:8765/ai/history` 可查看已保存 AI 历史观点；`http://127.0.0.1:8765/ai/changes` 可查看最近两次 AI 观点的变化；`http://127.0.0.1:8765/ai/outcomes` 可复盘已保存 AI 观点的后续表现；个股详情页包含 AI 观点、相关新闻、本地观察记录、分项分、触发规则、最近日线表和轻量走势 SVG 图。
+
+当最新股票日线按工作日估算存在明显滞后时，总览、AI 选股、因子验证和策略回测会显示“日线时效提醒”，并链接到日线健康页；提示仅作更新状态判断，不包含交易所节假日和盘中状态。
 
 ## 公式型因子和回测
 
@@ -152,10 +167,32 @@ python -m ths_stock_picker serve --host 127.0.0.1 --port 8765
 ```powershell
 python -m ths_stock_picker factors
 python -m ths_stock_picker factor-scan --limit 20
+python -m ths_stock_picker refresh-factor-scan-cache --limit 20
 python -m ths_stock_picker factor-backtest --horizon 5 --limit-symbols 300
+python -m ths_stock_picker factor-matrix --horizons 3,5,10 --limit-symbols 300 --max-bars 260
+python -m ths_stock_picker refresh-factor-cache --horizons 3,5,10 --limit-symbols 300 --max-bars 260
+python -m ths_stock_picker strategy-backtest --horizon 5 --top-n 10 --min-signal-score 60 --limit-symbols 300 --cost-bps 5 --slippage-bps 5 --benchmark-symbol sh000300 --max-bars 260 --execution next_open --position-mode non_overlapping --save
+python -m ths_stock_picker strategy-backtest-runs --limit 20
+python -m ths_stock_picker strategy-walkforward --train-days 252 --test-days 63 --max-folds 4 --horizon 5 --top-n 10 --min-signal-score 60 --limit-symbols 100 --cost-bps 5 --slippage-bps 5 --benchmark-symbol sh000300
+python -m ths_stock_picker strategy-validate --train-days 252 --test-days 63 --max-folds 4 --horizon 5 --top-n 10 --min-signal-score 60 --limit-symbols 100 --cost-bps 5 --slippage-bps 5 --benchmark-symbol sh000300
+python -m ths_stock_picker strategy-validation-runs --limit 20
+python -m ths_stock_picker import-tdx-history --tdx-root D:\new_tdx --include-indices --replace-existing --limit-symbols 300
+python -m ths_stock_picker tdx-status --tdx-root D:\new_tdx
 ```
 
 这些因子会作为 AI 选股的证据之一，但不会单独决定买卖。后续可以从 `https://www.gupang.com/` 等公式资料库继续挑选逻辑清晰的公式，转换为因子后再加入回测。
+
+`factor-scan` 和 Web 因子页会复用 `factor_scan_cache`，缓存键包含实际候选股票池和显示条数；`factor-matrix` 和 AI 因子质量评估会复用 `factor_backtest_cache`，缓存键包含回测周期、股票池规模和 K 线窗口。两类缓存均校验轻量的 `daily_bars` 版本号，导入或删除日线时版本号会自动递增，因此无需扫描全表也能在通达信数据更新后立即失效。导入大量数据后可先运行 `refresh-factor-scan-cache` 与 `refresh-factor-cache` 预热，减少首次打开页面的等待。
+
+`strategy-backtest` 是组合策略研究回测：每天只根据当日及以前的日线因子信号选股，按信号分选 Top N，持有指定交易日后统计收益。默认 `--execution next_open`，即信号日收盘生成信号、下一交易日开盘买入、持有指定交易日后按收盘卖出；可改为 `signal_close` 做假设对照。默认 `--position-mode non_overlapping`，上一批到期后才允许下一批入场；`daily_batches` 会允许批次重叠，只用于研究信号表现。无成交量或缺失价格的入场、出场日会跳过；对接近标准涨跌幅、且开高低收相同的一字涨跌停，也会保守地跳过。结果会按实际买入日提供年度、月度独立批次表现，帮助识别收益是否集中在少数时段。可用 `--cost-bps` 和 `--slippage-bps` 设置单边交易成本和滑点，结果会同时保留毛收益并统计扣减后的净收益；可用 `--benchmark-symbol` 指定已导入日线的指数或基准代码，例如 `sh000300`；`--max-bars` 控制每只股票使用最近多少根 K 线，传 `0` 可跑全历史。传入 `--save` 或在 Web 回测页点击“保存本次回测”会保存参数、结果摘要、完整结果和日线版本指纹，可用 `strategy-backtest-runs` 或 `/strategy-backtest-runs` 复核，并可点开单条记录查看保存时的权益曲线、交易样本和期间统计。当前版本仍未计入 ST 历史涨跌幅、复权处理和完整停牌规则等约束，结果用于筛选和迭代策略，不作为交易建议。
+
+`strategy-walkforward` 会把历史切成固定长度的训练窗口和紧随其后的独立测试窗口。每一折的因子有效性只使用训练截止日以前的日线，测试期只生成测试区间的信号和交易；输出每折训练/测试日期、独立批次数、交易数、净均收和最大回撤。样本外结果用于否定或保留策略假设，不应只挑选表现较好的折。
+
+`strategy-validate` 会在滚动样本外验证后应用固定的准入门槛，并自动把参数、日线版本指纹、每折结果和结论保存到 SQLite。结论分为“样本不足、未通过、观察、通过”：至少需要指定折数和交易数，样本外组合收益必须为正、正收益折占比和回撤达到门槛；已提供且完整覆盖的基准还必须有正超额。基准缺失或覆盖不完整时最多为“观察”，不会误标为“通过”。默认门槛可用 `--min-folds`、`--min-trades`、`--min-positive-fold-ratio`、`--max-drawdown` 和 `--min-benchmark-excess-return` 调整。`strategy-validation-runs` 用于复查历史结论；日线更新后版本指纹会变化，旧结论不会被当作新数据上的验证结果。
+
+`import-tdx-history` 会只读解析本机通达信 `vipdoc/sh/lday` 和 `vipdoc/sz/lday` 下的 `.day` 日线文件，导入现有 `daily_bars` 表。`.day` 是通达信未复权日线；读取日线时系统按 `TDX 未复权 > CSV/其他 > 腾讯前复权` 选择唯一规范来源，绝不对不同来源的同日价格求平均。`--include-indices` 只会加入沪市 `000/880/899` 和深市 `399` 开头的已识别指数，不会把债券等其它 `.day` 文件误作指数。`tdx-status` 会只读扫描股票与指数文件的末条日期；先用它确认下载源更新，再运行 `import-tdx-history`。`data-health` 会列出数据源覆盖、同代码同日期冲突和按股票日线计算的工作日时效；时效只是近似提醒，不包含节假日和盘中状态。即使有优先级，仍建议将通达信作为主数据源时使用 `--replace-existing`，保持回测口径单一。
+
+相对强弱因子采用 RPS 思路：按可比股票池的 60/120 日阶段涨幅做横截面百分位排名。`RPS60 相对强势`、`RPS120 长期强势` 是趋势加分项，`RPS60 相对弱势` 是风险过滤项；策略回测里 RPS 权重低于直接量价形态，避免单纯追高排名。
 
 ## 同花顺实时缓存监控
 
@@ -182,6 +219,7 @@ python -m ths_stock_picker ths-monitor
 - 置信度：基于价格字段、成交额/换手率、评分分项、日线数量和本地备注完整度计算
 - 正向证据：趋势、流动性、换手质量、盘中位置、本地标签等
 - 风险点：追高、换手过热、趋势破位、波动过高、ST/退市风险等
+- 触发条件与失效条件：基于 MA5/MA20、评分门槛和观察状态生成，保存到每次 thesis 中供复盘核对
 - 下一步动作：等待回踩、复核行业催化、观察 MA5/MA20 支撑等
 
 新闻来源优先使用同花顺本地明文资讯缓存，例如 `text\同花顺\实时解盘.xml`。可手动导入和查看：
@@ -204,9 +242,11 @@ python -m ths_stock_picker ai-explain 600000 --save
 python -m ths_stock_picker ai-history --limit 30
 python -m ths_stock_picker ai-history --symbol 600000
 python -m ths_stock_picker ai-changes --limit 50
+python -m ths_stock_picker ai-outcomes --limit 30 --horizon 5
+python -m ths_stock_picker ai-outcomes --symbol 600000 --horizon 10
 ```
 
-使用 `--save` 或 Web 上的“保存本次 AI 榜单”会把生成的结构化观点写入 `ai_decisions` 表，供后续复盘和对比。`ai-changes` 会对每只股票最近两次保存的 AI 观点做比较，标记新增、结论变化、置信度变化和稳定项。后续可在这一层接入 OpenAI 或本地大模型，让大模型读取同一份结构化证据后生成更细的行业、财务和风险复盘。
+使用 `--save` 或 Web 上的“保存本次 AI 榜单”会把生成的结构化观点写入 `ai_decisions` 表，供后续复盘和对比。每日流程在同一代码、同一评分日重复执行时会替换旧快照，避免重复存档；原始手动保存仍会留在历史中。`ai-changes` 和 `ai-outcomes` 都按“代码 + 评分日”去重并保留最新版本。`ai-outcomes` 以保存时评分日为信号日，从下一个有效交易日开盘观察到第 N 个后续交易日收盘；日线未更新或观察期未满时会保留“待观察”，不会补造收益结论。复盘页还会按保存结论汇总已完成样本的命中率和平均收益，待观察和无法评估的记录不参与收益统计。Web 对应页面为 `/ai/outcomes`。后续可在这一层接入 OpenAI 或本地大模型，让大模型读取同一份结构化证据后生成更细的行业、财务和风险复盘。
 
 本地观察记录保存在项目 SQLite 的 `stock_notes` 表里，不会写回同花顺文件。可以在个股详情页编辑，也可以进入 `http://127.0.0.1:8765/notes` 查看“观察、持有、回避、复盘”分组后的观察池。观察池支持搜索代码/名称/标签/备注、按更新时间/评分/涨跌幅/现价/代码排序、导出 CSV，并可在列表页删除本地记录。命令行同样支持写入、筛选、搜索、排序和删除：
 
