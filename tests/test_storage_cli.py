@@ -13,11 +13,11 @@ from unittest.mock import patch
 from ths_stock_picker.ai_decision import AIDecision, analyze_symbol, rank_candidates
 from ths_stock_picker.cli import main
 from ths_stock_picker.history_import import DailyBar
-from ths_stock_picker.news_import import load_ths_news_xml
+from ths_stock_picker.news_import import fetch_eastmoney_announcements, load_ths_news_xml
 from ths_stock_picker.quote_observer import QuoteObservation
 from ths_stock_picker.storage import Repository, assess_strategy_walk_forward, summarize_ai_decision_outcomes
 from ths_stock_picker.ths_monitor import inspect_ths_source
-from ths_stock_picker.models import QuoteRealtime, Security, WatchlistEntry
+from ths_stock_picker.models import NewsItem, QuoteRealtime, Security, WatchlistEntry
 from ths_stock_picker.web_panel import (
     DashboardFilters,
     NotesFilters,
@@ -846,6 +846,51 @@ class StorageCliTests(unittest.TestCase):
                     self.assertIn("RuntimeError: AI unavailable", summary["ai_snapshot_error"])
                     self.assertIn("AI snapshot skipped", output.getvalue())
 
+    def test_run_daily_public_announcements_failure_is_non_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / "picker.db"
+            ths_root = make_fake_ths(root)
+            output = io.StringIO()
+            with (
+                patch("ths_stock_picker.cli._import_public_quotes", return_value=0),
+                patch("ths_stock_picker.cli._select_universe_symbols", return_value=("test", ["000538"])),
+                patch("ths_stock_picker.cli.fetch_eastmoney_announcements", side_effect=RuntimeError("network down")),
+                patch("ths_stock_picker.cli.fetch_tencent_daily_bars", return_value=[]),
+                patch("ths_stock_picker.cli._export", return_value=0),
+                redirect_stdout(output),
+            ):
+                self.assertEqual(
+                    main(
+                        [
+                            "--db",
+                            str(db),
+                            "--ths-root",
+                            str(ths_root),
+                            "run-daily",
+                            "--limit",
+                            "1",
+                            "--public-announcements",
+                        ]
+                    ),
+                    0,
+                )
+
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                run = repo.daily_runs(limit=1)[0]
+                html = render_daily_runs_page(repo)
+            finally:
+                repo.close()
+
+        summary = json.loads(run["summary_json"])
+        self.assertEqual(summary["public_announcement_status"], "failed")
+        self.assertIn("RuntimeError: network down", summary["public_announcement_error"])
+        self.assertIn("Public announcements skipped", output.getvalue())
+        self.assertIn("公告", html)
+        self.assertIn("失败", html)
+
     def test_run_daily_failure_is_recorded_and_listed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "missing-ths"
@@ -894,6 +939,7 @@ class StorageCliTests(unittest.TestCase):
         self.assertIn("每日运行记录", html)
         self.assertIn("TDX 已覆盖", html)
         self.assertIn("行情时效", html)
+        self.assertIn("公告", html)
         self.assertIn("succeeded", html)
         self.assertIn("120", html)
 
@@ -1396,6 +1442,94 @@ class StorageCliTests(unittest.TestCase):
             self.assertEqual(news_rows[0]["news_id"], "n1")
             self.assertIn("资讯列表", html)
             self.assertIn("相关新闻", detail_html)
+
+    def test_eastmoney_public_announcements_parse_jsonp_and_feed_related_news(self) -> None:
+        payload = (
+            'jQuery1123({"data":{"list":[{'
+            '"art_code":"AN202607101826875477",'
+            '"codes":[{"stock_code":"000538","short_name":"云南白药"}],'
+            '"columns":[{"column_name":"调研活动"}],'
+            '"display_time":"2026-07-10 17:13:03:756",'
+            '"title":"云南白药:2026年7月10日调研活动附件之投资者调研会议记录",'
+            '"title_ch":"云南白药:2026年7月10日调研活动附件之投资者调研会议记录"'
+            '}]}})'
+        )
+
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return payload.encode("utf-8")
+
+        def fake_open(_request: object, timeout: float = 10.0) -> FakeResponse:
+            self.assertEqual(timeout, 5.0)
+            return FakeResponse()
+
+        items = fetch_eastmoney_announcements(["000538"], per_symbol=2, timeout=5.0, opener=fake_open)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].news_id, "eastmoney:AN202607101826875477")
+        self.assertEqual(items[0].source, "东方财富公告")
+        self.assertEqual(items[0].event_time, "2026-07-10 17:13:03")
+        self.assertIn("000538 云南白药", items[0].summary)
+        self.assertIn("公告", items[0].tags)
+        self.assertNotIn("政策监管", items[0].tags)
+        self.assertNotIn("并购投资", items[0].tags)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_news_items(items)
+                rows = repo.related_news_for_symbol("000538", name="云南白药")
+            finally:
+                repo.close()
+
+        self.assertEqual(rows[0]["title"], "云南白药:2026年7月10日调研活动附件之投资者调研会议记录")
+
+    def test_import_public_announcements_cli_populates_news_table(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            item = NewsItem(
+                news_id="eastmoney:AN1",
+                title="云南白药:调研活动记录",
+                summary="000538 云南白药；公告栏目：调研活动",
+                source="东方财富公告",
+                event_time="2026-07-10 17:13:03",
+                importance=None,
+                tags="公告",
+                source_file=Path("public/eastmoney_announcements/000538"),
+            )
+
+            with patch("ths_stock_picker.cli.fetch_eastmoney_announcements", return_value=[item]) as mocked_fetch:
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = main(
+                        [
+                            "--db",
+                            str(db),
+                            "import-public-announcements",
+                            "000538",
+                            "--per-symbol",
+                            "1",
+                        ]
+                    )
+
+            self.assertEqual(code, 0)
+            mocked_fetch.assert_called_once()
+            self.assertIn("Imported public announcements: 1", output.getvalue())
+
+            repo = Repository(db)
+            try:
+                rows = repo.latest_news(query="云南白药")
+            finally:
+                repo.close()
+
+            self.assertEqual(rows[0]["source"], "东方财富公告")
 
     def test_import_cli_populates_database(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

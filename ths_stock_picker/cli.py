@@ -15,7 +15,7 @@ from .field_inference import (
     write_capture,
 )
 from .history_import import fetch_tencent_daily_bars, load_daily_bars_csv
-from .news_import import load_default_ths_news
+from .news_import import fetch_eastmoney_announcements, load_default_ths_news
 from .quote_observer import fetch_tencent_observations, write_observations_csv
 from .scoring_profile import load_scoring_profile, write_default_scoring_profile
 from .storage import DEFAULT_DB_PATH, Repository, summarize_ai_decision_outcomes
@@ -50,6 +50,12 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("ths-monitor", help="Inspect TongHuaShun process and realtime cache freshness.")
     news_import_parser = subparsers.add_parser("import-ths-news", help="Import local TongHuaShun news cache.")
     news_import_parser.add_argument("--limit-per-file", type=int)
+    public_news_parser = subparsers.add_parser("import-public-announcements", help="Import public Eastmoney announcements for selected A-share symbols.")
+    public_news_parser.add_argument("symbols", nargs="*")
+    public_news_parser.add_argument("--universe", choices=["auto", "watchlist", "securities", "cache"], default="auto")
+    public_news_parser.add_argument("--limit", type=int, default=30)
+    public_news_parser.add_argument("--per-symbol", type=int, default=3)
+    public_news_parser.add_argument("--timeout", type=float, default=10.0)
     news_parser = subparsers.add_parser("news", help="Show imported news items.")
     news_parser.add_argument("--limit", type=int, default=30)
     news_parser.add_argument("--q", default="")
@@ -344,6 +350,9 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Optional inclusive TDX start date (YYYY-MM-DD). Defaults to the latest stored TDX date.",
     )
+    daily_parser.add_argument("--public-announcements", action="store_true", help="Also import public Eastmoney announcements for the daily universe.")
+    daily_parser.add_argument("--public-announcement-limit", type=int, default=30)
+    daily_parser.add_argument("--public-announcements-per-symbol", type=int, default=3)
     daily_runs_parser = subparsers.add_parser("daily-runs", help="List saved daily pipeline runs and failures.")
     daily_runs_parser.add_argument("--limit", type=int, default=20)
     serve_parser = subparsers.add_parser("serve", help="Start a read-only local web dashboard.")
@@ -371,6 +380,8 @@ def main(argv: list[str] | None = None) -> int:
             return _ths_monitor(args.ths_root)
         if args.command == "import-ths-news":
             return _import_ths_news(repo, args.ths_root, args.limit_per_file)
+        if args.command == "import-public-announcements":
+            return _import_public_announcements(repo, args.symbols, args.universe, args.limit, args.per_symbol, args.timeout)
         if args.command == "news":
             return _news(repo, args.limit, args.q, args.tag)
         if args.command == "factors":
@@ -503,6 +514,9 @@ def main(argv: list[str] | None = None) -> int:
                 args.tdx_root,
                 args.tdx_include_indices,
                 args.tdx_start_date,
+                args.public_announcements,
+                args.public_announcement_limit,
+                args.public_announcements_per_symbol,
             )
         if args.command == "daily-runs":
             return _daily_runs(repo, args.limit)
@@ -568,10 +582,34 @@ def _import_ths_news(repo: Repository, ths_root: Path, limit_per_file: int | Non
     return 0
 
 
+def _import_public_announcements(
+    repo: Repository,
+    symbols: list[str],
+    universe: str,
+    limit: int,
+    per_symbol: int,
+    timeout: float,
+) -> int:
+    selected = sorted({symbol.strip() for symbol in symbols if symbol.strip()})
+    if not selected:
+        source, selected = _select_universe_symbols(repo, universe, limit)
+        print(f"Using {source} universe for announcements: {len(selected)} symbols")
+    if not selected:
+        print("No symbols available for public announcements. Pass symbols or import/score a universe first.")
+        return 1
+    items = fetch_eastmoney_announcements(selected[:limit], per_symbol=per_symbol, timeout=timeout)
+    imported = repo.upsert_news_items(items)
+    print(f"Fetched public announcements: symbols={len(selected[:limit])} items={len(items)}")
+    print(f"Imported public announcements: {imported}")
+    for item in items[:10]:
+        print(f"- {item.event_time or '-'} {item.title} [{item.tags}]")
+    return 0 if items else 1
+
+
 def _news(repo: Repository, limit: int, query: str, tag: str) -> int:
     rows = repo.latest_news(limit=limit, query=query, tag=tag)
     if not rows:
-        print("No news found. Run import-ths-news first.")
+        print("No news found. Run import-ths-news or import-public-announcements first.")
         return 0
     for row in rows:
         print(f"{row['event_time'] or '-'} {row['title']} [{row['tags']}] {row['source'] or '-'}")
@@ -1616,6 +1654,9 @@ def _run_daily(
     tdx_root: Path | None = None,
     tdx_include_indices: bool = False,
     tdx_start_date: str = "",
+    public_announcements: bool = False,
+    public_announcement_limit: int = 30,
+    public_announcements_per_symbol: int = 3,
 ) -> int:
     parameters = {
         "limit": limit,
@@ -1626,10 +1667,15 @@ def _run_daily(
         "tdx_root": str(tdx_root) if tdx_root is not None else None,
         "tdx_include_indices": tdx_include_indices,
         "tdx_start_date": tdx_start_date or None,
+        "public_announcements": public_announcements,
+        "public_announcement_limit": public_announcement_limit,
+        "public_announcements_per_symbol": public_announcements_per_symbol,
     }
     run_id = repo.start_daily_run(parameters)
     summary: dict[str, object] = {"run_id": run_id}
     total_steps = 8 if tdx_root is not None else 7
+    if public_announcements:
+        total_steps += 1
     next_step = 1
     current_step = "import_tdx_history" if tdx_root is not None else "import_local_cache"
     try:
@@ -1655,6 +1701,43 @@ def _run_daily(
         next_step += 1
         print(f"Step {next_step}/{total_steps}: importing TongHuaShun local news")
         _import_ths_news(repo, adapter.root, limit_per_file=300)
+
+        if public_announcements:
+            current_step = "import_public_announcements"
+            next_step += 1
+            print(f"Step {next_step}/{total_steps}: importing public announcements")
+            try:
+                announcement_source, announcement_symbols = _select_universe_symbols(
+                    repo,
+                    universe,
+                    min(limit, public_announcement_limit),
+                )
+                announcement_items = fetch_eastmoney_announcements(
+                    announcement_symbols,
+                    per_symbol=public_announcements_per_symbol,
+                )
+                announcement_imported = repo.upsert_news_items(announcement_items)
+                summary.update(
+                    {
+                        "public_announcement_status": "saved" if announcement_imported else "empty",
+                        "public_announcement_source": announcement_source,
+                        "public_announcement_symbols": len(announcement_symbols),
+                        "public_announcements_imported": announcement_imported,
+                    }
+                )
+                print(
+                    f"Imported public announcements: symbols={len(announcement_symbols)} "
+                    f"items={announcement_imported}"
+                )
+            except Exception as error:
+                summary.update(
+                    {
+                        "public_announcement_status": "failed",
+                        "public_announcements_imported": 0,
+                        "public_announcement_error": f"{type(error).__name__}: {error}",
+                    }
+                )
+                print(f"Public announcements skipped: {type(error).__name__}: {error}")
 
         current_step = "import_public_quotes"
         next_step += 1

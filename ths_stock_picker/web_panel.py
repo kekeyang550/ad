@@ -1147,7 +1147,7 @@ def _render_context_help(kind: str) -> str:
         ),
         "news": (
             "消息面",
-            "这里查看同花顺本地资讯缓存和主题标签。AI 会把个股相关新闻或行业主题新闻作为辅助证据。",
+            "这里查看同花顺本地资讯缓存和公开公告兜底数据。AI 会把个股相关新闻或行业主题新闻作为辅助证据。",
             [("AI 选股", "/ai"), ("因子", "/factors"), ("观察池", "/notes")],
         ),
     }.get(kind)
@@ -1449,7 +1449,7 @@ def _render_news_table(rows: list[object]) -> str:
             "</tr>"
         )
     if not body:
-        body.append('<tr><td colspan="5" class="empty">暂无资讯，请先运行 import-ths-news。</td></tr>')
+        body.append('<tr><td colspan="5" class="empty">暂无资讯，请先运行 import-ths-news 或 import-public-announcements。</td></tr>')
     return _table_section("资讯列表", ["时间", "标题", "标签", "来源", "摘要"], body)
 
 
@@ -1650,6 +1650,7 @@ def _render_daily_runs(rows: list[object]) -> str:
         freshness_text = _daily_run_freshness_label(summary)
         quote_freshness_text = _daily_run_quote_freshness_label(summary)
         ai_snapshot_text = _daily_run_ai_snapshot_label(summary)
+        announcements_text = _daily_run_public_announcements_label(summary, parameters)
         parameter_text = (
             f"标的上限 {parameters.get('limit', '-')}，"
             f"日线 {parameters.get('history_days', '-')} 日，"
@@ -1667,16 +1668,17 @@ def _render_daily_runs(rows: list[object]) -> str:
             f"<td>{_e(freshness_text)}</td>"
             f"<td>{_e(quote_freshness_text)}</td>"
             f"<td>{_e(ai_snapshot_text)}</td>"
+            f"<td>{_e(announcements_text)}</td>"
             f"<td>{_e(summary.get('failed_step') or '-')}</td>"
             f"<td>{_e(parameter_text)}</td>"
             f"<td>{_e(row['error_text'] or '-')}</td>"
             "</tr>"
         )
     if not body:
-        body.append('<tr><td colspan="13" class="empty">暂无每日运行记录。请先运行 run-daily。</td></tr>')
+        body.append('<tr><td colspan="14" class="empty">暂无每日运行记录。请先运行 run-daily。</td></tr>')
     return _table_section(
         "最近每日运行",
-        ["开始时间", "结束时间", "状态", "标的", "TDX 已覆盖", "TDX 同步", "公开日线", "日线时效", "行情时效", "AI 快照", "失败步骤", "参数", "错误"],
+        ["开始时间", "结束时间", "状态", "标的", "TDX 已覆盖", "TDX 同步", "公开日线", "日线时效", "行情时效", "AI 快照", "公告", "失败步骤", "参数", "错误"],
         body,
     )
 
@@ -1716,6 +1718,22 @@ def _daily_run_quote_freshness_label(summary: dict[str, object]) -> str:
     if freshness == "empty":
         return "暂无带价格行情"
     return f"无法判断 · {latest_date} · {priced_symbols} 只"
+
+
+def _daily_run_public_announcements_label(summary: dict[str, object], parameters: dict[str, object]) -> str:
+    if not parameters.get("public_announcements") and "public_announcement_status" not in summary:
+        return "未启用"
+    status = str(summary.get("public_announcement_status") or "unknown")
+    if status == "saved":
+        return f"已保存 {int(summary.get('public_announcements_imported') or 0)} 条"
+    if status == "empty":
+        return "无新增"
+    if status == "failed":
+        return "失败"
+    imported = summary.get("public_announcements_imported")
+    if imported is not None:
+        return f"已保存 {int(imported or 0)} 条"
+    return "-"
 
 
 def _daily_run_ai_snapshot_label(summary: dict[str, object]) -> str:

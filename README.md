@@ -28,6 +28,8 @@ D:\同花顺软件\同花顺
 python -m ths_stock_picker status
 python -m ths_stock_picker ths-monitor
 python -m ths_stock_picker import-ths-news
+python -m ths_stock_picker import-public-announcements 000538 --per-symbol 3
+python -m ths_stock_picker import-public-announcements --universe auto --limit 30 --per-symbol 3
 python -m ths_stock_picker news --limit 20
 python -m ths_stock_picker news --tag AI算力
 python -m ths_stock_picker factors
@@ -61,7 +63,7 @@ python -m ths_stock_picker import-public-quotes 600000 000001 600519 --observati
 python -m ths_stock_picker import-public-quotes --from-cache --limit 200
 python -m ths_stock_picker import-public-history --universe auto --limit 200 --days 80
 python -m ths_stock_picker universe --source auto --limit 50
-python -m ths_stock_picker run-daily --limit 200 --history-days 80 --profile configs\scoring.default.json --tdx-root D:\new_tdx --tdx-include-indices --out-dir outputs
+python -m ths_stock_picker run-daily --limit 200 --history-days 80 --profile configs\scoring.default.json --tdx-root D:\new_tdx --tdx-include-indices --public-announcements --public-announcement-limit 30 --out-dir outputs
 python -m ths_stock_picker daily-runs --limit 20
 python -m ths_stock_picker import-history path\to\daily.csv
 python -m ths_stock_picker score
@@ -223,15 +225,17 @@ python -m ths_stock_picker ths-monitor
 - 触发条件与失效条件：基于 MA5/MA20、评分门槛和观察状态生成，保存到每次 thesis 中供复盘核对
 - 下一步动作：等待回踩、复核行业催化、观察 MA5/MA20 支撑等
 
-新闻来源优先使用同花顺本地明文资讯缓存，例如 `text\同花顺\实时解盘.xml`。可手动导入和查看：
+新闻来源优先使用同花顺本地明文资讯缓存，例如 `text\同花顺\实时解盘.xml`。如果本机同花顺资讯缓存为空，可用东方财富公开公告作为个股相关新闻兜底；公开公告会按股票代码/名称写入同一张 `news_items` 表，供 `/news`、个股详情页和 `/diagnose` 使用。可手动导入和查看：
 
 ```powershell
 python -m ths_stock_picker import-ths-news
+python -m ths_stock_picker import-public-announcements 000538 --per-symbol 3
+python -m ths_stock_picker import-public-announcements --universe auto --limit 30 --per-symbol 3
 python -m ths_stock_picker news --limit 20
 python -m ths_stock_picker news --tag AI算力
 ```
 
-新闻会被打上初步事件标签，例如业绩预告、退市风险、并购投资、AI算力、消费、新能源、政策监管。AI 选股会优先匹配个股相关新闻；没有直接个股新闻时，会按板块/名称补充主题新闻作为辅助证据。
+新闻会被打上初步事件标签，例如业绩预告、退市风险、并购投资、AI算力、消费、新能源、政策监管和公告。普通投资者关系、董事会会议等公开公告默认只作为“公告”证据，不直接当作风险或利好；退市、立案、处罚、并购重组等关键词才会影响 AI 风险/正向新闻信号。AI 选股会优先匹配个股相关新闻；没有直接个股新闻时，会按板块/名称补充主题新闻作为辅助证据。`run-daily` 可加 `--public-announcements --public-announcement-limit 30 --public-announcements-per-symbol 3` 同步当日股票池公告；公开公告网络失败时会写入每日记录，但不会阻断行情、评分和导出。
 
 命令行：
 
