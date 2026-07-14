@@ -2461,6 +2461,20 @@ class StorageCliTests(unittest.TestCase):
                         ),
                     ]
                 )
+                repo.upsert_news_items(
+                    [
+                        NewsItem(
+                            news_id="eastmoney:PA1",
+                            title="平安银行:关于投资者关系活动记录表",
+                            summary="000001 平安银行；公告栏目：调研活动",
+                            source="东方财富公告",
+                            event_time="2026-07-08 18:00:00",
+                            importance=None,
+                            tags="公告",
+                            source_file=Path("public/eastmoney_announcements/000001"),
+                        )
+                    ]
+                )
                 repo.score_latest_quotes()
                 count = repo.write_candidates_csv(candidates_path)
                 report_count = repo.write_daily_report(report_path)
@@ -2471,7 +2485,10 @@ class StorageCliTests(unittest.TestCase):
             self.assertEqual(report_count, 1)
             self.assertIn("平安银行", candidates_path.read_text(encoding="utf-8-sig"))
             self.assertNotIn("*ST康佳A", candidates_path.read_text(encoding="utf-8-sig"))
-            self.assertIn("# A 股选股日报", report_path.read_text(encoding="utf-8"))
+            report_text = report_path.read_text(encoding="utf-8")
+            self.assertIn("# A 股选股日报", report_text)
+            self.assertIn("消息面", report_text)
+            self.assertIn("1条：平安银行:关于投资者关系活动记录表", report_text)
 
     def test_web_dashboard_renders_candidates_and_counts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

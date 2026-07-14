@@ -237,6 +237,8 @@ python -m ths_stock_picker news --tag AI算力
 
 新闻会被打上初步事件标签，例如业绩预告、退市风险、并购投资、AI算力、消费、新能源、政策监管和公告。普通投资者关系、董事会会议等公开公告默认只作为“公告”证据，不直接当作风险或利好；退市、立案、处罚、并购重组等关键词才会影响 AI 风险/正向新闻信号。AI 选股会优先匹配个股相关新闻；没有直接个股新闻时，会按板块/名称补充主题新闻作为辅助证据。`run-daily` 可加 `--public-announcements --public-announcement-limit 30 --public-announcements-per-symbol 3` 同步当日股票池公告；公开公告网络失败时会写入每日记录，但不会阻断行情、评分和导出。
 
+`report` 和每日流程生成的 `daily_report.md` 会在候选榜中附加“消息面”列，显示每只候选的相关新闻数量与最新标题，便于盘后快速筛掉需要先读公告的标的。
+
 命令行：
 
 ```powershell

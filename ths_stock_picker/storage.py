@@ -2535,13 +2535,15 @@ class Repository:
             "",
             "## 候选榜",
             "",
-            "| 排名 | 代码 | 名称 | 板块 | 分数 | 现价 | 涨跌幅 | 成交额 | 总市值 | 换手率 | 主要理由 |",
-            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+            "| 排名 | 代码 | 名称 | 板块 | 分数 | 现价 | 涨跌幅 | 成交额 | 总市值 | 换手率 | 主要理由 | 消息面 |",
+            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
         ]
         for index, row in enumerate(rows, start=1):
             rules = json.loads(row["triggered_rules_json"])
+            news_rows = self.related_news_for_symbol(str(row["symbol"]), name=row["name"], limit=3)
+            news_text = _daily_report_news_summary(news_rows)
             lines.append(
-                "| {rank} | {symbol} | {name} | {board} | {score:.2f} | {price:.2f} | {pct:.2f}% | {amount:.0f} | {market_cap:.2f}亿 | {turnover:.2f}% | {rules} |".format(
+                "| {rank} | {symbol} | {name} | {board} | {score:.2f} | {price:.2f} | {pct:.2f}% | {amount:.0f} | {market_cap:.2f}亿 | {turnover:.2f}% | {rules} | {news} |".format(
                     rank=index,
                     symbol=row["symbol"],
                     name=(row["name"] or "").replace("|", "/"),
@@ -2553,6 +2555,7 @@ class Repository:
                     market_cap=(row["market_cap"] or 0) / 100_000_000,
                     turnover=row["turnover_rate"] or 0,
                     rules=", ".join(rules[:4]).replace("|", "/"),
+                    news=news_text,
                 )
             )
         lines.extend(
@@ -2563,10 +2566,20 @@ class Repository:
                 "- 本报告用于个人投研辅助，不构成投资建议。",
                 "- 候选池已排除 ST/PT/退市名称风险、0 价格和非正分股票。",
                 "- 实时价格来自公开行情补充源；同花顺本地缓存用于证券池、名称、市场和诊断。",
+                "- 消息面列来自同花顺本地资讯缓存和公开公告兜底，只作复核线索。",
             ]
         )
         output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return len(rows)
+
+
+def _daily_report_news_summary(rows: list[sqlite3.Row]) -> str:
+    if not rows:
+        return "-"
+    latest = str(rows[0]["title"] or "").replace("|", "/")
+    if len(latest) > 38:
+        latest = latest[:35] + "..."
+    return f"{len(rows)}条：{latest}"
 
 
 def _score_date_from_thesis(raw: object) -> str:
