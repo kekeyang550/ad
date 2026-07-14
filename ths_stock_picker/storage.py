@@ -16,13 +16,15 @@ from .scoring_profile import ScoringProfile, default_scoring_profile
 
 DEFAULT_DB_PATH = Path("work/ths_stock_picker.db")
 CANONICAL_DAILY_BAR_POLICY_VERSION = 1
+SQLITE_BUSY_TIMEOUT_SECONDS = 30
 
 
 class Repository:
     def __init__(self, db_path: Path = DEFAULT_DB_PATH):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
+        self.conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_SECONDS * 1000}")
         self.conn.row_factory = sqlite3.Row
 
     def close(self) -> None:

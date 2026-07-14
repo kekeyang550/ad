@@ -46,6 +46,16 @@ from tests.test_ths_local import make_fake_ths
 
 
 class StorageCliTests(unittest.TestCase):
+    def test_repository_sets_sqlite_busy_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Repository(Path(temp_dir) / "picker.db")
+            try:
+                timeout_ms = repo.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            finally:
+                repo.close()
+
+            self.assertGreaterEqual(timeout_ms, 30_000)
+
     def test_daily_bars_prefer_tdx_source_and_report_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db = Path(temp_dir) / "picker.db"
