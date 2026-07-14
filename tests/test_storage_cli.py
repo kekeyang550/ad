@@ -2521,6 +2521,20 @@ class StorageCliTests(unittest.TestCase):
                         )
                     ]
                 )
+                repo.upsert_news_items(
+                    [
+                        NewsItem(
+                            news_id="eastmoney:PA-dashboard",
+                            title="平安银行:关于投资者关系活动记录表",
+                            summary="000001 平安银行；公告栏目：调研活动",
+                            source="东方财富公告",
+                            event_time="2026-07-08 18:00:00",
+                            importance=None,
+                            tags="公告",
+                            source_file=Path("public/eastmoney_announcements/000001"),
+                        )
+                    ]
+                )
                 repo.score_latest_quotes()
                 html = render_dashboard(repo)
             finally:
@@ -2531,6 +2545,8 @@ class StorageCliTests(unittest.TestCase):
             self.assertIn("/symbol/000001", html)
             self.assertIn("当前评分 default", html)
             self.assertIn("候选池", html)
+            self.assertIn("消息面", html)
+            self.assertIn("1条：平安银行:关于投资者关系活动记录表", html)
             self.assertIn("评分榜", html)
 
     def test_web_dashboard_filters_by_query_and_board(self) -> None:

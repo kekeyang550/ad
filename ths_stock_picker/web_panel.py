@@ -121,7 +121,7 @@ def render_dashboard(repo: Repository, limit: int = 30, filters: DashboardFilter
             _render_dashboard_guide(counts, quote_health, len(candidates), len(run_changes)),
             _render_counts(counts),
             _render_filters(active_filters),
-            _render_candidates(candidates),
+            _render_candidates(repo, candidates),
             _render_run_changes(run_changes),
             _render_scores(scores),
             _render_snapshots(snapshots),
@@ -1409,10 +1409,11 @@ def _render_filters(filters: DashboardFilters) -> str:
     )
 
 
-def _render_candidates(rows: list[object]) -> str:
+def _render_candidates(repo: Repository, rows: list[object]) -> str:
     body = []
     for index, row in enumerate(rows, start=1):
         rules = _top_rules(row["triggered_rules_json"])
+        news_label = _candidate_news_label(repo.related_news_for_symbol(str(row["symbol"]), name=row["name"], limit=3))
         body.append(
             "<tr>"
             f"<td>{index}</td>"
@@ -1424,15 +1425,25 @@ def _render_candidates(rows: list[object]) -> str:
             f"<td class=\"num\">{_fmt(row['pct_change'])}%</td>"
             f"<td class=\"num\">{_fmt_yi(row['amount'])}亿</td>"
             f"<td>{_e(rules)}</td>"
+            f"<td>{_e(news_label)}</td>"
             "</tr>"
         )
     if not body:
-        body.append('<tr><td colspan="9" class="empty">暂无候选，请先运行 run-daily。</td></tr>')
+        body.append('<tr><td colspan="10" class="empty">暂无候选，请先运行 run-daily。</td></tr>')
     return _table_section(
         "候选池",
-        ["#", "代码", "名称", "板块", "分数", "现价", "涨跌幅", "成交额", "主要理由"],
+        ["#", "代码", "名称", "板块", "分数", "现价", "涨跌幅", "成交额", "主要理由", "消息面"],
         body,
     )
+
+
+def _candidate_news_label(rows: list[object]) -> str:
+    if not rows:
+        return "-"
+    title = str(rows[0]["title"] or "")
+    if len(title) > 24:
+        title = title[:21] + "..."
+    return f"{len(rows)}条：{title}"
 
 
 def _render_scores(rows: list[object]) -> str:
