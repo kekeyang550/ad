@@ -1908,13 +1908,16 @@ def _daily_runs(repo: Repository, limit: int) -> int:
                     quote_freshness = str(quote_health.get("freshness_status") or "-")
                 ai_snapshot = str(summary.get("ai_snapshot_status") or "-")
                 ai_saved = int(summary.get("ai_decisions_saved") or 0)
+                announcement_status = str(summary.get("public_announcement_status") or "-")
+                announcement_count = int(summary.get("public_announcements_imported") or 0)
                 detail = (
                     f"history_bars={summary.get('history_bars_imported', 0)} "
                     f"history_symbols={summary.get('history_symbols', 0)} "
                     f"tdx_covered={summary.get('tdx_covered_symbols', 0)} "
                     f"tdx_sync_bars={summary.get('tdx_daily_bars_imported', 0)} "
                     f"daily_freshness={freshness} quote_freshness={quote_freshness} "
-                    f"ai_snapshot={ai_snapshot}:{ai_saved}"
+                    f"ai_snapshot={ai_snapshot}:{ai_saved} "
+                    f"announcements={announcement_status}:{announcement_count}"
                 )
             else:
                 detail = f"failed_step={summary.get('failed_step', '-')}"

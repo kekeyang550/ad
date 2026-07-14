@@ -883,6 +883,9 @@ class StorageCliTests(unittest.TestCase):
                 html = render_daily_runs_page(repo)
             finally:
                 repo.close()
+            listed = io.StringIO()
+            with redirect_stdout(listed):
+                self.assertEqual(main(["--db", str(db), "daily-runs", "--limit", "1"]), 0)
 
         summary = json.loads(run["summary_json"])
         self.assertEqual(summary["public_announcement_status"], "failed")
@@ -890,6 +893,7 @@ class StorageCliTests(unittest.TestCase):
         self.assertIn("Public announcements skipped", output.getvalue())
         self.assertIn("公告", html)
         self.assertIn("失败", html)
+        self.assertIn("announcements=failed:0", listed.getvalue())
 
     def test_run_daily_failure_is_recorded_and_listed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
