@@ -239,6 +239,8 @@ python -m ths_stock_picker news --tag AI算力
 
 `report` 和每日流程生成的 `daily_report.md` 会在候选榜中附加“消息面”列，显示每只候选的相关新闻数量与最新标题，便于盘后快速筛掉需要先读公告的标的。
 
+`candidates` 命令和首页“导出 CSV”也会附加 `news_count`、`latest_news_time`、`latest_news_title`、`latest_news_tags` 和 `latest_news_source` 字段，方便在 Excel/WPS 里筛选有公告或业绩预告的候选。
+
 命令行：
 
 ```powershell

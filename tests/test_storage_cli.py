@@ -2483,8 +2483,12 @@ class StorageCliTests(unittest.TestCase):
 
             self.assertEqual(count, 1)
             self.assertEqual(report_count, 1)
-            self.assertIn("平安银行", candidates_path.read_text(encoding="utf-8-sig"))
-            self.assertNotIn("*ST康佳A", candidates_path.read_text(encoding="utf-8-sig"))
+            candidates_text = candidates_path.read_text(encoding="utf-8-sig")
+            self.assertIn("平安银行", candidates_text)
+            self.assertIn("news_count", candidates_text)
+            self.assertIn("latest_news_title", candidates_text)
+            self.assertIn("平安银行:关于投资者关系活动记录表", candidates_text)
+            self.assertNotIn("*ST康佳A", candidates_text)
             report_text = report_path.read_text(encoding="utf-8")
             self.assertIn("# A 股选股日报", report_text)
             self.assertIn("消息面", report_text)
@@ -2627,6 +2631,20 @@ class StorageCliTests(unittest.TestCase):
                         ),
                     ]
                 )
+                repo.upsert_news_items(
+                    [
+                        NewsItem(
+                            news_id="eastmoney:SMIC1",
+                            title="中芯国际:港股公告证券变动月报表",
+                            summary="688981 中芯国际；公告栏目：港股公告",
+                            source="东方财富公告",
+                            event_time="2026-07-03 19:10:30",
+                            importance=None,
+                            tags="公告",
+                            source_file=Path("public/eastmoney_announcements/688981"),
+                        )
+                    ]
+                )
                 repo.score_latest_quotes()
                 csv_text = render_candidates_csv(repo, filters=DashboardFilters(query="中芯", board="科创板"))
             finally:
@@ -2634,6 +2652,9 @@ class StorageCliTests(unittest.TestCase):
 
             self.assertIn("688981", csv_text)
             self.assertIn("中芯国际", csv_text)
+            self.assertIn("news_count", csv_text)
+            self.assertIn("latest_news_title", csv_text)
+            self.assertIn("中芯国际:港股公告证券变动月报表", csv_text)
             self.assertNotIn("000001", csv_text)
 
     def test_web_dashboard_symbol_detail_renders_breakdown(self) -> None:

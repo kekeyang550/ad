@@ -2489,6 +2489,11 @@ class Repository:
             "high",
             "low",
             "observed_at",
+            "news_count",
+            "latest_news_time",
+            "latest_news_title",
+            "latest_news_tags",
+            "latest_news_source",
             "rules",
             "components",
         ]
@@ -2496,6 +2501,9 @@ class Repository:
             writer = csv.writer(handle)
             writer.writerow(columns)
             for row in rows:
+                news_summary = _news_export_summary(
+                    self.related_news_for_symbol(str(row["symbol"]), name=row["name"], limit=3)
+                )
                 writer.writerow(
                     [
                         row["score_date"],
@@ -2514,6 +2522,11 @@ class Repository:
                         row["high"],
                         row["low"],
                         row["observed_at"],
+                        news_summary["news_count"],
+                        news_summary["latest_news_time"],
+                        news_summary["latest_news_title"],
+                        news_summary["latest_news_tags"],
+                        news_summary["latest_news_source"],
                         " | ".join(json.loads(row["triggered_rules_json"])),
                         row["components_json"],
                     ]
@@ -2540,8 +2553,9 @@ class Repository:
         ]
         for index, row in enumerate(rows, start=1):
             rules = json.loads(row["triggered_rules_json"])
-            news_rows = self.related_news_for_symbol(str(row["symbol"]), name=row["name"], limit=3)
-            news_text = _daily_report_news_summary(news_rows)
+            news_text = _daily_report_news_summary(
+                self.related_news_for_symbol(str(row["symbol"]), name=row["name"], limit=3)
+            )
             lines.append(
                 "| {rank} | {symbol} | {name} | {board} | {score:.2f} | {price:.2f} | {pct:.2f}% | {amount:.0f} | {market_cap:.2f}亿 | {turnover:.2f}% | {rules} | {news} |".format(
                     rank=index,
@@ -2580,6 +2594,25 @@ def _daily_report_news_summary(rows: list[sqlite3.Row]) -> str:
     if len(latest) > 38:
         latest = latest[:35] + "..."
     return f"{len(rows)}条：{latest}"
+
+
+def _news_export_summary(rows: list[sqlite3.Row]) -> dict[str, object]:
+    if not rows:
+        return {
+            "news_count": 0,
+            "latest_news_time": "",
+            "latest_news_title": "",
+            "latest_news_tags": "",
+            "latest_news_source": "",
+        }
+    latest = rows[0]
+    return {
+        "news_count": len(rows),
+        "latest_news_time": latest["event_time"] or "",
+        "latest_news_title": latest["title"] or "",
+        "latest_news_tags": latest["tags"] or "",
+        "latest_news_source": latest["source"] or "",
+    }
 
 
 def _score_date_from_thesis(raw: object) -> str:

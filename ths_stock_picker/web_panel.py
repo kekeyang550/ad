@@ -140,8 +140,27 @@ def render_candidates_csv(repo: Repository, limit: int = 500, filters: Dashboard
     )[:limit]
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow(["symbol", "name", "board", "total_score", "latest_price", "pct_change", "amount", "turnover_rate", "rules"])
+    writer.writerow(
+        [
+            "symbol",
+            "name",
+            "board",
+            "total_score",
+            "latest_price",
+            "pct_change",
+            "amount",
+            "turnover_rate",
+            "news_count",
+            "latest_news_time",
+            "latest_news_title",
+            "latest_news_tags",
+            "latest_news_source",
+            "rules",
+        ]
+    )
     for row in rows:
+        news = repo.related_news_for_symbol(str(row["symbol"]), name=row["name"], limit=3)
+        news_summary = _csv_news_summary(news)
         writer.writerow(
             [
                 row["symbol"],
@@ -152,10 +171,34 @@ def render_candidates_csv(repo: Repository, limit: int = 500, filters: Dashboard
                 row["pct_change"],
                 row["amount"],
                 row["turnover_rate"],
+                news_summary["news_count"],
+                news_summary["latest_news_time"],
+                news_summary["latest_news_title"],
+                news_summary["latest_news_tags"],
+                news_summary["latest_news_source"],
                 " | ".join(json.loads(row["triggered_rules_json"])),
             ]
         )
     return output.getvalue()
+
+
+def _csv_news_summary(rows: list[object]) -> dict[str, object]:
+    if not rows:
+        return {
+            "news_count": 0,
+            "latest_news_time": "",
+            "latest_news_title": "",
+            "latest_news_tags": "",
+            "latest_news_source": "",
+        }
+    latest = rows[0]
+    return {
+        "news_count": len(rows),
+        "latest_news_time": latest["event_time"] or "",
+        "latest_news_title": latest["title"] or "",
+        "latest_news_tags": latest["tags"] or "",
+        "latest_news_source": latest["source"] or "",
+    }
 
 
 def render_notes_page(
