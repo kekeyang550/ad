@@ -70,6 +70,7 @@ python -m ths_stock_picker scores --limit 20 --positive-only
 python -m ths_stock_picker score-runs --limit 10
 python -m ths_stock_picker compare-runs --limit 20
 python -m ths_stock_picker explain 600000 --bars 8
+python -m ths_stock_picker diagnose 600000 --bars 8
 python -m ths_stock_picker note 600000 --status watch --tags "银行,低波" --text "观察回踩"
 python -m ths_stock_picker notes --limit 20
 python -m ths_stock_picker notes --limit 20 --status review
@@ -142,7 +143,7 @@ python -m ths_stock_picker write-default-profile --out configs\scoring.default.j
 python -m ths_stock_picker serve --host 127.0.0.1 --port 8765
 ```
 
-浏览器打开 `http://127.0.0.1:8765/`，可以查看数据表计数、候选池、评分榜、批次变化和同花顺缓存解析诊断。首页支持按代码/名称搜索、按板块筛选、设置最低分、排序和导出当前候选 CSV；`http://127.0.0.1:8765/daily-runs` 可复查每日数据更新流水线的成功或失败记录；`http://127.0.0.1:8765/ths` 可查看同花顺进程和 A 股实时缓存活跃度；`http://127.0.0.1:8765/data-health` 可查看日线来源、覆盖范围与同日冲突；`http://127.0.0.1:8765/news` 可查看同花顺本地新闻缓存；`http://127.0.0.1:8765/factors` 可查看公式型因子定义、当前命中和历史回测，`http://127.0.0.1:8765/factors/{factor_id}` 可查看单因子的逻辑、来源、未来函数风险、当前命中与多周期表现；`http://127.0.0.1:8765/backtest` 可用真实日线做组合策略回测并保存本次结果；`http://127.0.0.1:8765/strategy-backtest-runs` 可复查已保存的回测参数、摘要和日线版本；`http://127.0.0.1:8765/strategy-validation` 可复查已保存的滚动样本外结论、参数和数据版本；`http://127.0.0.1:8765/ai` 会生成 AI 辅助选股榜，并可一键保存本次榜单；`http://127.0.0.1:8765/ai/history` 可查看已保存 AI 历史观点；`http://127.0.0.1:8765/ai/changes` 可查看最近两次 AI 观点的变化；`http://127.0.0.1:8765/ai/outcomes` 可复盘已保存 AI 观点的后续表现；个股详情页包含 AI 观点、相关新闻、本地观察记录、分项分、触发规则、最近日线表和轻量走势 SVG 图。
+浏览器打开 `http://127.0.0.1:8765/`，可以查看数据表计数、候选池、评分榜、批次变化和同花顺缓存解析诊断。首页支持按代码/名称搜索、按板块筛选、设置最低分、排序和导出当前候选 CSV；`http://127.0.0.1:8765/diagnose` 可输入 6 位代码做一键诊股，汇总评分、AI 观点、触发条件、失效条件、本地备注、近期日线和数据覆盖状态；`http://127.0.0.1:8765/daily-runs` 可复查每日数据更新流水线的成功或失败记录；`http://127.0.0.1:8765/ths` 可查看同花顺进程和 A 股实时缓存活跃度；`http://127.0.0.1:8765/data-health` 可查看日线来源、覆盖范围与同日冲突；`http://127.0.0.1:8765/news` 可查看同花顺本地新闻缓存；`http://127.0.0.1:8765/factors` 可查看公式型因子定义、当前命中和历史回测，`http://127.0.0.1:8765/factors/{factor_id}` 可查看单因子的逻辑、来源、未来函数风险、当前命中与多周期表现；`http://127.0.0.1:8765/backtest` 可用真实日线做组合策略回测并保存本次结果；`http://127.0.0.1:8765/strategy-backtest-runs` 可复查已保存的回测参数、摘要和日线版本；`http://127.0.0.1:8765/strategy-validation` 可复查已保存的滚动样本外结论、参数和数据版本；`http://127.0.0.1:8765/ai` 会生成 AI 辅助选股榜，并可一键保存本次榜单；`http://127.0.0.1:8765/ai/history` 可查看已保存 AI 历史观点；`http://127.0.0.1:8765/ai/changes` 可查看最近两次 AI 观点的变化；`http://127.0.0.1:8765/ai/outcomes` 可复盘已保存 AI 观点的后续表现；个股详情页包含 AI 观点、相关新闻、本地观察记录、分项分、触发规则、最近日线表和轻量走势 SVG 图。
 
 当最新股票日线按工作日估算存在明显滞后时，总览、AI 选股、因子验证和策略回测会显示“日线时效提醒”，并链接到日线健康页；提示仅作更新状态判断，不包含交易所节假日和盘中状态。
 

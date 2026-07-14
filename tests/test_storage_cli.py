@@ -25,6 +25,7 @@ from ths_stock_picker.web_panel import (
     render_dashboard,
     render_data_health_page,
     render_daily_runs_page,
+    render_diagnose_page,
     render_strategy_validation_page,
     render_strategy_backtest_runs_page,
     render_strategy_backtest_run_detail_page,
@@ -2008,6 +2009,7 @@ class StorageCliTests(unittest.TestCase):
                 ranked = rank_candidates(repo, limit=5)
                 html = render_ai_page(repo)
                 detail_html = render_symbol_detail(repo, "688981")
+                diagnose_html = render_diagnose_page(repo, "688981")
             finally:
                 repo.close()
 
@@ -2025,6 +2027,12 @@ class StorageCliTests(unittest.TestCase):
             self.assertIn("加入观察", html)
             self.assertIn("触发条件", detail_html)
             self.assertIn("失效条件", detail_html)
+            self.assertIn("数据覆盖状态", detail_html)
+            self.assertIn("近60日线", detail_html)
+            self.assertIn("一键诊股", diagnose_html)
+            self.assertIn("中芯国际", diagnose_html)
+            self.assertIn("触发条件", diagnose_html)
+            self.assertIn("数据覆盖状态", diagnose_html)
 
             output = io.StringIO()
             with redirect_stdout(output):
@@ -2032,6 +2040,11 @@ class StorageCliTests(unittest.TestCase):
             self.assertIn("中芯国际", output.getvalue())
             self.assertIn("Trigger conditions:", output.getvalue())
             self.assertIn("Invalidation conditions:", output.getvalue())
+            diagnose_output = io.StringIO()
+            with redirect_stdout(diagnose_output):
+                self.assertEqual(main(["--db", str(db), "diagnose", "688981"]), 0)
+            self.assertIn("Diagnosis: 688981", diagnose_output.getvalue())
+            self.assertIn("Conclusion:", diagnose_output.getvalue())
             repo = Repository(db)
             try:
                 rows = repo.latest_ai_decisions(5)

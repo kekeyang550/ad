@@ -156,6 +156,9 @@ def main(argv: list[str] | None = None) -> int:
     explain_parser = subparsers.add_parser("explain", help="Explain latest score for one symbol.")
     explain_parser.add_argument("symbol")
     explain_parser.add_argument("--bars", type=int, default=8)
+    diagnose_parser = subparsers.add_parser("diagnose", help="Run a one-symbol stock diagnosis from score, AI thesis, notes, and recent bars.")
+    diagnose_parser.add_argument("symbol")
+    diagnose_parser.add_argument("--bars", type=int, default=8)
     note_parser = subparsers.add_parser("note", help="Create or update a local stock note.")
     note_parser.add_argument("symbol")
     note_parser.add_argument("--status", default="watch", choices=["watch", "hold", "avoid", "review"])
@@ -419,6 +422,8 @@ def main(argv: list[str] | None = None) -> int:
             return _compare_runs(repo, args.base_run, args.target_run, args.limit, args.min_score)
         if args.command == "explain":
             return _explain(repo, args.symbol, args.bars)
+        if args.command == "diagnose":
+            return _diagnose(repo, args.symbol, args.bars)
         if args.command == "note":
             return _note(repo, args.symbol, args.status, args.tags, args.text)
         if args.command == "notes":
@@ -1025,6 +1030,64 @@ def _explain(repo: Repository, symbol: str, bars: int) -> int:
                 f"high={_fmt_number(item['high'])} low={_fmt_number(item['low'])} "
                 f"volume={_fmt_number(item['volume'], digits=0)}"
             )
+    return 0
+
+
+def _diagnose(repo: Repository, symbol: str, bars: int) -> int:
+    if not (len(symbol) == 6 and symbol.isdigit()):
+        print(f"Invalid symbol: {symbol}. Pass a 6-digit A-share code.")
+        return 1
+    row = repo.score_explanation(symbol)
+    decision = analyze_symbol(repo, symbol)
+    if row is None or decision is None:
+        print(f"No diagnosis available for {symbol}. Run run-daily or score first.")
+        return 1
+
+    print(f"Diagnosis: {decision.symbol} {decision.name or '-'}")
+    print(f"Conclusion: {decision.decision} confidence={decision.confidence:.0f}")
+    print(f"Summary: {decision.summary}")
+    print(
+        f"Score: date={row['score_date']} total={float(row['total_score']):.2f} "
+        f"price={_fmt_number(row['latest_price'])} pct={_fmt_number(row['pct_change'])}% "
+        f"amount={_fmt_number(row['amount'])} turnover={_fmt_number(row['turnover_rate'])}%"
+    )
+
+    note = repo.stock_note(symbol)
+    if note is not None:
+        print(f"Local note: status={note['status']} tags={note['tags'] or '-'} note={note['note'] or '-'}")
+
+    sections = [
+        ("Strengths", decision.strengths),
+        ("Risks", decision.risks),
+        ("Trigger conditions", decision.trigger_conditions),
+        ("Invalidation conditions", decision.invalidation_conditions),
+        ("Next actions", decision.next_actions),
+    ]
+    for title, items in sections:
+        print(f"{title}:")
+        for item in items:
+            print(f"- {item}")
+
+    factor_signals = decision.evidence.get("factor_signals", [])
+    if isinstance(factor_signals, list) and factor_signals:
+        print("Factor signals:")
+        for item in factor_signals[:5]:
+            if isinstance(item, dict):
+                print(
+                    f"- {item.get('name', '-')} direction={item.get('direction', '-')} "
+                    f"strength={_fmt_number(item.get('strength'))} verdict={item.get('effectiveness_verdict') or '-'}"
+                )
+
+    daily_rows = repo.recent_daily_bars(symbol, limit=bars)
+    if daily_rows:
+        print("Recent daily bars:")
+        for item in daily_rows:
+            print(
+                f"- {item['trade_date']} close={_fmt_number(item['close'])} "
+                f"high={_fmt_number(item['high'])} low={_fmt_number(item['low'])} "
+                f"volume={_fmt_number(item['volume'], digits=0)}"
+            )
+    print("Notice: research assistance only; not investment advice.")
     return 0
 
 

@@ -43,14 +43,15 @@ def analyze_symbol(repo: Any, symbol: str) -> AIDecision | None:
     components = json.loads(row["components_json"])
     rules = json.loads(row["triggered_rules_json"])
     trend = _trend_metrics(bars)
+    factor_quality = _factor_quality_map(repo)
     news_signal = _news_signal(news)
     decision = _decision_label(row, components, rules, trend, note, news_signal)
-    strengths = _strengths(row, components, rules, trend, note, news, factor_signals)
-    risks = _risks(row, components, rules, trend, note, news, factor_signals)
+    strengths = _strengths(row, components, rules, trend, note, news, factor_signals, factor_quality)
+    risks = _risks(row, components, rules, trend, note, news, factor_signals, factor_quality)
     trigger_conditions = _trigger_conditions(decision, row, trend)
     invalidation_conditions = _invalidation_conditions(decision, row, trend)
     next_actions = _next_actions(decision, row, trend, risks, note)
-    confidence = _confidence(row, components, trend, note, news)
+    confidence = _confidence(row, components, trend, note, news, factor_signals, factor_quality)
     summary = _summary(row, decision, confidence, strengths, risks, trend, news)
 
     return AIDecision(
@@ -77,7 +78,7 @@ def analyze_symbol(repo: Any, symbol: str) -> AIDecision | None:
             "components": components,
             "rules": rules,
             "trend": trend,
-            "factor_signals": _factor_evidence(repo, factor_signals),
+            "factor_signals": _factor_evidence(factor_signals, factor_quality),
             "news": [_news_evidence(item) for item in news],
             "news_signal": news_signal,
             "note": dict(note) if note is not None else None,
@@ -158,6 +159,7 @@ def _strengths(
     note: Any,
     news: list[Any],
     factor_signals: list[Any],
+    factor_quality: dict[str, dict[str, object]],
 ) -> list[str]:
     items: list[str] = []
     score = float(row["total_score"] or 0.0)
@@ -179,7 +181,8 @@ def _strengths(
     if note is not None and note["tags"]:
         items.append(f"本地标签：{note['tags']}")
     for signal in factor_signals:
-        if signal.direction == "positive":
+        verdict = str(factor_quality.get(signal.factor_id, {}).get("verdict") or "")
+        if signal.direction == "positive" and verdict not in {"反向"}:
             items.append(f"公式型因子：{signal.name}，{signal.reason}")
             break
     for item in news:
@@ -200,6 +203,7 @@ def _risks(
     note: Any,
     news: list[Any],
     factor_signals: list[Any],
+    factor_quality: dict[str, dict[str, object]],
 ) -> list[str]:
     items: list[str] = []
     pct = float(row["pct_change"] or 0.0)
@@ -226,6 +230,11 @@ def _risks(
     for signal in factor_signals:
         if signal.direction == "risk":
             items.append(f"公式型风险：{signal.name}，{signal.reason}")
+            break
+    for signal in factor_signals:
+        warning = _factor_quality_warning(signal, factor_quality.get(signal.factor_id, {}))
+        if warning:
+            items.append(warning)
             break
     if not items:
         items.append("当前主要风险不突出，但仍需结合大盘和行业环境复核")
@@ -301,7 +310,15 @@ def _invalidation_conditions(decision: str, row: Any, trend: dict[str, float | N
     return conditions[:2]
 
 
-def _confidence(row: Any, components: dict[str, float], trend: dict[str, float | None], note: Any, news: list[Any]) -> float:
+def _confidence(
+    row: Any,
+    components: dict[str, float],
+    trend: dict[str, float | None],
+    note: Any,
+    news: list[Any],
+    factor_signals: list[Any],
+    factor_quality: dict[str, dict[str, object]],
+) -> float:
     confidence = 45.0
     if row["latest_price"] is not None and row["pct_change"] is not None:
         confidence += 15
@@ -315,6 +332,8 @@ def _confidence(row: Any, components: dict[str, float], trend: dict[str, float |
         confidence += 6
     if news:
         confidence += 5
+    if any(_factor_quality_warning(signal, factor_quality.get(signal.factor_id, {})) for signal in factor_signals):
+        confidence -= 8
     return min(95.0, confidence)
 
 
@@ -378,8 +397,7 @@ def _news_evidence(item: Any) -> dict[str, object]:
     }
 
 
-def _factor_evidence(repo: Any, signals: list[Any]) -> list[dict[str, object]]:
-    quality = _factor_quality_map(repo)
+def _factor_evidence(signals: list[Any], quality: dict[str, dict[str, object]]) -> list[dict[str, object]]:
     rows = []
     for item in signals:
         row = asdict(item)
@@ -389,6 +407,17 @@ def _factor_evidence(repo: Any, signals: list[Any]) -> list[dict[str, object]]:
         row["effectiveness_samples"] = quality_row.get("total_samples")
         rows.append(row)
     return rows
+
+
+def _factor_quality_warning(signal: Any, quality_row: dict[str, object]) -> str:
+    verdict = str(quality_row.get("verdict") or "")
+    samples = quality_row.get("total_samples")
+    sample_text = f"，样本 {samples}" if samples else ""
+    if signal.direction == "positive" and verdict in {"反向", "中性"}:
+        return f"当前触发正向因子“{signal.name}”，但近期期测历史结论为{verdict}{sample_text}，需要降低权重"
+    if signal.direction == "risk" and verdict == "有效":
+        return f"当前触发风险因子“{signal.name}”，且历史结论为有效{sample_text}，需优先复核"
+    return ""
 
 
 def _factor_quality_map(repo: Any) -> dict[str, dict[str, object]]:

@@ -114,6 +114,7 @@ def render_dashboard(repo: Repository, limit: int = 30, filters: DashboardFilter
             '<div class="actions"><a class="refresh" href="/">刷新</a><a class="refresh primary-action" href="/ai">AI 选股</a></div>',
             "</section>",
             _render_app_nav("/"),
+            _render_diagnose_search(),
             _render_daily_data_freshness_notice(repo),
             _render_quote_freshness_notice(repo),
             _render_ai_candidate_availability(quote_coverage, bool(candidates)),
@@ -533,8 +534,8 @@ def render_news_page(repo: Repository, query: str = "", tag: str = "", limit: in
 
 
 def render_symbol_detail(repo: Repository, symbol: str, bars_limit: int = 20) -> str:
-    row = repo.score_explanation(symbol)
-    if row is None:
+    detail = _symbol_detail_sections(repo, symbol, bars_limit=bars_limit)
+    if detail is None:
         return _page(
             "个股详情",
             [
@@ -542,7 +543,42 @@ def render_symbol_detail(repo: Repository, symbol: str, bars_limit: int = 20) ->
                 '<section class="panel"><p class="empty">暂无评分，请先运行 run-daily 或 score。</p></section>',
             ],
         )
+    title, sections = detail
+    return _page(
+        title,
+        [
+            _topbar(title, sections[0], back_link="/"),
+            *sections[1:],
+        ],
+    )
 
+
+def render_diagnose_page(repo: Repository, symbol: str = "", bars_limit: int = 20) -> str:
+    selected_symbol = symbol.strip()
+    body = [
+        _topbar("一键诊股", "输入 6 位 A 股代码，汇总评分、AI 观点、触发条件、失效条件和本地备注", back_link="/"),
+        _render_diagnose_search(selected_symbol),
+    ]
+    if not selected_symbol:
+        body.append('<section class="panel"><p class="empty">请输入代码后开始诊断。</p></section>')
+        return _page("一键诊股", body)
+    if not (len(selected_symbol) == 6 and selected_symbol.isdigit()):
+        body.append('<section class="panel"><p class="empty">代码格式不正确，请输入 6 位数字。</p></section>')
+        return _page("一键诊股", body)
+
+    detail = _symbol_detail_sections(repo, selected_symbol, bars_limit=bars_limit)
+    if detail is None:
+        body.append('<section class="panel"><p class="empty">暂无评分，请先运行 run-daily 或 score。</p></section>')
+        return _page("一键诊股", body)
+    _, sections = detail
+    body.extend(sections[1:])
+    return _page("一键诊股", body)
+
+
+def _symbol_detail_sections(repo: Repository, symbol: str, bars_limit: int) -> tuple[str, list[str]] | None:
+    row = repo.score_explanation(symbol)
+    if row is None:
+        return None
     components = json.loads(row["components_json"])
     rules = json.loads(row["triggered_rules_json"])
     bars = repo.recent_daily_bars(symbol, limit=bars_limit)
@@ -553,11 +589,12 @@ def render_symbol_detail(repo: Repository, symbol: str, bars_limit: int = 20) ->
     if not related_news and ai_decision is not None:
         related_news = ai_decision.evidence.get("news", [])
     title = f"{row['symbol']} {row['name'] or ''}".strip()
-    return _page(
+    return (
         title,
         [
-            _topbar(title, f"评分日期 {row['score_date']} · 数据只读 · 不构成投资建议", back_link="/"),
+            f"评分日期 {row['score_date']} · 数据只读 · 不构成投资建议",
             _render_quote_summary(row),
+            _render_diagnosis_data_status(row, chart_bars, related_news, note, ai_decision),
             _render_ai_symbol_decision(ai_decision),
             _render_stock_note(symbol, note),
             _render_related_news(related_news),
@@ -631,6 +668,17 @@ def serve_dashboard(
                 try:
                     repo.init_schema()
                     page = render_data_health_page(repo)
+                finally:
+                    repo.close()
+                self._write_text(page, "text/html; charset=utf-8")
+                return
+            if parsed.path == "/diagnose":
+                query = parse_qs(parsed.query)
+                symbol = (_first(query, "symbol") or "").strip()
+                repo = Repository(db_path)
+                try:
+                    repo.init_schema()
+                    page = render_diagnose_page(repo, symbol=symbol)
                 finally:
                     repo.close()
                 self._write_text(page, "text/html; charset=utf-8")
@@ -1184,6 +1232,7 @@ def _render_app_nav(active: str) -> str:
     items = [
         ("/", "总览"),
         ("/daily-runs", "每日记录"),
+        ("/diagnose", "一键诊股"),
         ("/ai", "AI 选股"),
         ("/backtest", "策略回测"),
         ("/strategy-validation", "样本外验证"),
@@ -1200,9 +1249,26 @@ def _render_app_nav(active: str) -> str:
     return '<nav class="app-nav">' + "".join(links) + "</nav>"
 
 
+def _render_diagnose_search(symbol: str = "") -> str:
+    return (
+        '<section class="panel filter-panel diagnose-panel">'
+        '<form class="filters diagnose-form" method="get" action="/diagnose">'
+        "<label><span>股票代码</span>"
+        f'<input name="symbol" value="{_e(symbol)}" placeholder="例如 688981" inputmode="numeric" pattern="[0-9]{{6}}">'
+        "</label>"
+        '<button type="submit">诊股</button>'
+        '<a class="ghost" href="/ai">AI 选股</a>'
+        '<a class="ghost" href="/notes">观察池</a>'
+        "</form>"
+        "</section>"
+    )
+
+
 def _active_path_for_title(title: str) -> str:
     if title.startswith("AI"):
         return "/ai"
+    if "诊股" in title:
+        return "/diagnose"
     if "每日运行记录" in title:
         return "/daily-runs"
     if "样本外验证" in title:
@@ -2523,6 +2589,38 @@ def _render_quote_summary(row: object) -> str:
     return '<section class="metrics detail-metrics">' + "".join(cards) + "</section>"
 
 
+def _render_diagnosis_data_status(
+    row: object,
+    daily_rows: list[object],
+    news_rows: list[object],
+    note: object | None,
+    decision: AIDecision | None,
+) -> str:
+    latest_bar = daily_rows[0]["trade_date"] if daily_rows else "-"
+    priced = row["latest_price"] is not None and row["pct_change"] is not None
+    factor_count = 0
+    if decision is not None and isinstance(decision.evidence.get("factor_signals"), list):
+        factor_count = len(decision.evidence.get("factor_signals", []))
+    note_status = note["status"] if note is not None else "未记录"
+    items = [
+        ("行情字段", "已补价" if priced else "缺价格", "ok" if priced else "warn"),
+        ("近60日线", f"{len(daily_rows)} 根 · 最新 {latest_bar}", "ok" if len(daily_rows) >= 20 else "warn"),
+        ("公式因子", f"{factor_count} 个当前信号", "ok" if factor_count else "warn"),
+        ("相关新闻", f"{len(news_rows)} 条", "ok" if news_rows else "warn"),
+        ("本地备注", str(note_status), "ok" if note is not None else "warn"),
+    ]
+    cards = []
+    for label, value, status in items:
+        cards.append(
+            '<article class="metric compact-metric">'
+            f"<span>{_e(label)}</span>"
+            f"<strong>{_e(value)}</strong>"
+            f'<em class="pill {status}">{_e("可用" if status == "ok" else "待补")}</em>'
+            "</article>"
+        )
+    return '<section class="panel data-status-panel"><h2>数据覆盖状态</h2><div class="metrics status-metrics">' + "".join(cards) + "</div></section>"
+
+
 def _render_stock_note(symbol: str, note: object | None) -> str:
     status = note["status"] if note is not None else "watch"
     tags = note["tags"] if note is not None else ""
@@ -2959,10 +3057,14 @@ p { margin: 8px 0 0; color: #5f6c7b; font-size: 13px; line-height: 1.7; text-wra
 .data-freshness-warning p { margin: 0; max-width: 820px; color: #7c2d12; }
 .metrics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
 .detail-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.status-metrics { grid-template-columns: repeat(5, minmax(0, 1fr)); margin-bottom: 0; }
 .ths-metrics { grid-template-columns: minmax(120px, 0.8fr) minmax(180px, 1fr) minmax(240px, 1.4fr) minmax(260px, 1.8fr); }
 .metric { background: #ffffff; border: 1px solid #d8e0e8; border-radius: 8px; padding: 14px; }
 .metric span { display: block; color: #64748b; font-size: 12px; margin-bottom: 8px; }
 .metric strong { font-size: 24px; line-height: 1; font-variant-numeric: tabular-nums; }
+.compact-metric { display: grid; gap: 8px; align-content: start; }
+.compact-metric strong { font-size: 15px; line-height: 1.35; overflow-wrap: anywhere; }
+.compact-metric em { width: fit-content; font-style: normal; }
 .wide-metric strong { font-size: 15px; line-height: 1.35; overflow-wrap: anywhere; }
 .panel { background: #ffffff; border: 1px solid #d8e0e8; border-radius: 8px; padding: 16px; margin-top: 14px; }
 .filter-panel { padding: 12px 16px; }
@@ -2987,6 +3089,7 @@ p { margin: 8px 0 0; color: #5f6c7b; font-size: 13px; line-height: 1.7; text-wra
 .ai-history-filters { grid-template-columns: minmax(160px, 220px) minmax(120px, 160px) auto auto; }
 .backtest-filters { grid-template-columns: repeat(10, minmax(100px, 155px)) auto auto; }
 .news-filters { grid-template-columns: minmax(220px, 1fr) minmax(130px, 180px) minmax(100px, 140px) auto auto; }
+.diagnose-form { grid-template-columns: minmax(180px, 260px) auto auto auto; }
 .note-form { display: grid; grid-template-columns: minmax(120px, 0.5fr) minmax(220px, 1fr) auto; gap: 10px; align-items: end; }
 .note-form label { display: grid; gap: 5px; color: #52616f; font-size: 12px; font-weight: 700; }
 .note-form .note-text { grid-column: 1 / -1; }
