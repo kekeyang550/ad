@@ -274,7 +274,7 @@ python -m ths_stock_picker news --tag AI算力
 
 `report` 和每日流程生成的 `daily_report.md` 会在候选榜中附加“消息面”列，显示每只候选的相关新闻数量与最新标题，便于盘后快速筛掉需要先读公告的标的。
 
-`candidates` 命令和首页“导出 CSV”也会附加 `quote_observed_at`、`news_count`、`latest_news_time`、`latest_news_title`、`latest_news_tags` 和 `latest_news_source` 字段；首页候选池也会展示单只股票的行情时间，便于在 Excel/WPS 或页面内筛掉报价过期的候选。
+`candidates` 命令和首页“导出 CSV”也会附加 `quote_observed_at`、`news_count`、`latest_news_time`、`latest_news_title`、`latest_news_tags` 和 `latest_news_source` 字段；首页候选池、AI 榜单、已保存 AI 历史和个股诊断都会展示单只股票的行情时间。每条新保存 AI 观点会把该时间写入 thesis，个股详情会列出最近 5 条已保存观点，便于在 Excel/WPS 或页面内筛掉报价过期的候选；旧观点缺少该字段时显示 `-`。
 
 命令行：
 

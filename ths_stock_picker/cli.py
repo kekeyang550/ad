@@ -1307,6 +1307,7 @@ def _ai_pick(repo: Repository, limit: int, min_score: float, save: bool) -> int:
     for index, item in enumerate(decisions, start=1):
         print(f"{index}. {item.symbol} {item.name or '-'} {item.decision} confidence={item.confidence:.0f}")
         print(f"   {item.summary}")
+        print(f"   Quote observed at: {item.evidence.get('quote_observed_at') or '-'}")
         print(f"   Next: {'; '.join(item.next_actions[:2])}")
     if save:
         print(f"Saved AI decisions: {len(decisions)}")
@@ -1322,6 +1323,7 @@ def _ai_explain(repo: Repository, symbol: str, save: bool) -> int:
         repo.insert_ai_decisions(decisions_to_rows([decision]))
     print(f"{decision.symbol} {decision.name or '-'} {decision.decision} confidence={decision.confidence:.0f}")
     print(decision.summary)
+    print(f"Quote observed at: {decision.evidence.get('quote_observed_at') or '-'}")
     print("Strengths:")
     for item in decision.strengths:
         print(f"- {item}")

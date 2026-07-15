@@ -75,6 +75,7 @@ def analyze_symbol(repo: Any, symbol: str) -> AIDecision | None:
             "amount": row["amount"],
             "turnover_rate": row["turnover_rate"],
             "market_cap": row["market_cap"],
+            "quote_observed_at": row["observed_at"],
             "components": components,
             "rules": rules,
             "trend": trend,

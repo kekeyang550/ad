@@ -674,6 +674,7 @@ def _symbol_detail_sections(repo: Repository, symbol: str, bars_limit: int) -> t
     fundamental = repo.latest_fundamental(symbol)
     industry = repo.industry_for_symbol(symbol)
     ai_decision = analyze_symbol(repo, symbol)
+    saved_ai_decisions = repo.latest_ai_decisions(limit=5, symbol=symbol)
     related_news = repo.related_news_for_symbol(symbol, name=row["name"], limit=8)
     themes = repo.themes_for_symbol(symbol)
     if not related_news and ai_decision is not None:
@@ -686,6 +687,7 @@ def _symbol_detail_sections(repo: Repository, symbol: str, bars_limit: int) -> t
             _render_quote_summary(row),
             _render_diagnosis_data_status(row, chart_bars, related_news, note, ai_decision),
             _render_ai_symbol_decision(ai_decision),
+            _render_symbol_ai_history(saved_ai_decisions),
             _render_stock_note(symbol, note),
             _render_fundamental(fundamental),
             _render_industry_context(industry),
@@ -2724,6 +2726,7 @@ def _render_ai_decisions(decisions: list[AIDecision]) -> str:
     for index, item in enumerate(decisions, start=1):
         score = item.evidence.get("total_score")
         pct = item.evidence.get("pct_change")
+        quote_observed_at = item.evidence.get("quote_observed_at")
         factor_text = _factor_badges(item.evidence.get("factor_signals", []))
         quick_note = f"{item.decision}，置信度 {item.confidence:.0f}。{item.summary}"
         body.append(
@@ -2736,6 +2739,7 @@ def _render_ai_decisions(decisions: list[AIDecision]) -> str:
             f"<td class=\"num strong\">{item.confidence:.0f}</td>"
             f"<td class=\"num\">{_fmt(score)}</td>"
             f"<td class=\"num\">{_fmt(pct)}%</td>"
+            f"<td>{_e(quote_observed_at or '-')}</td>"
             f"<td>{factor_text}</td>"
             f"<td>{_e(item.summary)}</td>"
             '<td class="action-cell">'
@@ -2751,8 +2755,8 @@ def _render_ai_decisions(decisions: list[AIDecision]) -> str:
             "</tr>"
         )
     if not body:
-        body.append('<tr><td colspan="11" class="empty">暂无 AI 候选，请先运行 run-daily 或 score。</td></tr>')
-    return _table_section("AI 候选观点", ["#", "代码", "名称", "板块", "结论", "置信度", "评分", "涨跌幅", "公式因子", "摘要", "操作"], body)
+        body.append('<tr><td colspan="12" class="empty">暂无 AI 候选，请先运行 run-daily 或 score。</td></tr>')
+    return _table_section("AI 候选观点", ["#", "代码", "名称", "板块", "结论", "置信度", "评分", "涨跌幅", "行情时间", "公式因子", "摘要", "操作"], body)
 
 
 def _render_ai_history_controls(limit: int, symbol: str) -> str:
@@ -2777,6 +2781,7 @@ def _render_ai_history_controls(limit: int, symbol: str) -> str:
 def _render_ai_history(rows: list[object]) -> str:
     body = []
     for row in rows:
+        quote_observed_at = _thesis_quote_observed_at(row["thesis_json"])
         body.append(
             "<tr>"
             f"<td>#{row['id']}</td>"
@@ -2785,12 +2790,13 @@ def _render_ai_history(rows: list[object]) -> str:
             f"<td>{_e(row['name'] or '-')}</td>"
             f"<td><span class=\"pill ai-{_decision_class(row['decision'])}\">{_e(row['decision'])}</span></td>"
             f"<td class=\"num strong\">{float(row['confidence']):.0f}</td>"
+            f"<td>{_e(quote_observed_at or '-')}</td>"
             f"<td>{_e(row['summary'])}</td>"
             "</tr>"
         )
     if not body:
-        body.append('<tr><td colspan="7" class="empty">暂无已保存 AI 观点。</td></tr>')
-    return _table_section("历史观点", ["ID", "保存时间", "代码", "名称", "结论", "置信度", "摘要"], body)
+        body.append('<tr><td colspan="8" class="empty">暂无已保存 AI 观点。</td></tr>')
+    return _table_section("历史观点", ["ID", "保存时间", "代码", "名称", "结论", "置信度", "行情时间", "摘要"], body)
 
 
 def _render_ai_outcome_controls(limit: int, horizon: int, symbol: str) -> str:
@@ -2960,6 +2966,31 @@ def _render_ai_symbol_decision(decision: AIDecision | None) -> str:
         "</div>"
         f"{factor_table}"
         "</section>"
+    )
+
+
+def _render_symbol_ai_history(rows: list[object]) -> str:
+    if not rows:
+        return ""
+    body = []
+    for row in rows:
+        evidence = _thesis_evidence(row["thesis_json"])
+        score_date = evidence.get("score_date") or "-"
+        quote_observed_at = evidence.get("quote_observed_at") or "-"
+        body.append(
+            "<tr>"
+            f"<td>{_e(display_shanghai_time(row['run_at']))}</td>"
+            f"<td>{_e(score_date)}</td>"
+            f"<td><span class=\"pill ai-{_decision_class(row['decision'])}\">{_e(row['decision'])}</span></td>"
+            f"<td class=\"num strong\">{float(row['confidence']):.0f}</td>"
+            f"<td>{_e(quote_observed_at)}</td>"
+            f"<td>{_e(row['summary'])}</td>"
+            "</tr>"
+        )
+    return _table_section(
+        "最近保存的 AI 观点",
+        ["保存时间", "评分日", "结论", "置信度", "行情时间", "摘要"],
+        body,
     )
 
 
@@ -3421,6 +3452,22 @@ def _factor_link(factor_id: str, label: str | None = None) -> str:
     factor_text = _e(factor_id)
     label_text = _e(label if label is not None else factor_id)
     return f'<a class="symbol-link" href="/factors/{factor_text}">{label_text}</a>'
+
+
+def _thesis_evidence(raw: object) -> dict[str, object]:
+    try:
+        thesis = json.loads(str(raw or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(thesis, dict):
+        return {}
+    evidence = thesis.get("evidence")
+    return evidence if isinstance(evidence, dict) else {}
+
+
+def _thesis_quote_observed_at(raw: object) -> str:
+    quote_observed_at = _thesis_evidence(raw).get("quote_observed_at")
+    return str(quote_observed_at) if quote_observed_at else ""
 
 
 def _top_rules(raw: str) -> str:

@@ -2773,9 +2773,12 @@ class StorageCliTests(unittest.TestCase):
             self.assertIn("中芯国际", decision.summary)
             self.assertTrue(decision.trigger_conditions)
             self.assertTrue(decision.invalidation_conditions)
+            self.assertEqual(decision.evidence["quote_observed_at"], "2026-07-08 10:52:47")
             self.assertEqual(ranked[0].symbol, "688981")
             self.assertIn("AI 选股", html)
             self.assertIn("AI 候选观点", html)
+            self.assertIn("行情时间", html)
+            self.assertIn("2026-07-08 10:52:47", html)
             self.assertIn("公式因子", html)
             self.assertIn("/notes/quick-add", html)
             self.assertIn("加入观察", html)
@@ -2792,6 +2795,7 @@ class StorageCliTests(unittest.TestCase):
             with redirect_stdout(output):
                 self.assertEqual(main(["--db", str(db), "ai-explain", "688981", "--save"]), 0)
             self.assertIn("中芯国际", output.getvalue())
+            self.assertIn("Quote observed at: 2026-07-08 10:52:47", output.getvalue())
             self.assertIn("Trigger conditions:", output.getvalue())
             self.assertIn("Invalidation conditions:", output.getvalue())
             diagnose_output = io.StringIO()
@@ -2804,6 +2808,7 @@ class StorageCliTests(unittest.TestCase):
                 rows = repo.latest_ai_decisions(5)
                 filtered = repo.latest_ai_decisions(5, symbol="688981")
                 history_html = render_ai_history_page(repo)
+                saved_detail_html = render_symbol_detail(repo, "688981")
                 repo.insert_ai_decisions(
                     [
                         {
@@ -2830,6 +2835,7 @@ class StorageCliTests(unittest.TestCase):
                 )
                 changes = repo.ai_decision_changes(limit=5)
                 changes_html = render_ai_changes_page(repo)
+                legacy_history_html = render_ai_history_page(repo)
             finally:
                 repo.close()
             self.assertEqual(rows[0]["symbol"], "688981")
@@ -2837,8 +2843,14 @@ class StorageCliTests(unittest.TestCase):
             saved_thesis = json.loads(rows[0]["thesis_json"])
             self.assertIn("trigger_conditions", saved_thesis)
             self.assertIn("invalidation_conditions", saved_thesis)
+            self.assertEqual(saved_thesis["evidence"]["quote_observed_at"], "2026-07-08 10:52:47")
             self.assertIn("AI 历史", history_html)
             self.assertIn("中芯国际", history_html)
+            self.assertIn("行情时间", history_html)
+            self.assertIn("2026-07-08 10:52:47", history_html)
+            self.assertIn("<td>-</td>", legacy_history_html)
+            self.assertIn("最近保存的 AI 观点", saved_detail_html)
+            self.assertIn("2026-07-08 10:52:47", saved_detail_html)
             self.assertEqual(changes[0]["status"], "changed")
             self.assertIn("AI 变化", changes_html)
             self.assertIn("结论变化", changes_html)
