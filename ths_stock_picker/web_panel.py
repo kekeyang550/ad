@@ -150,6 +150,7 @@ def render_candidates_csv(repo: Repository, limit: int = 500, filters: Dashboard
             "pct_change",
             "amount",
             "turnover_rate",
+            "quote_observed_at",
             "news_count",
             "latest_news_time",
             "latest_news_title",
@@ -171,6 +172,7 @@ def render_candidates_csv(repo: Repository, limit: int = 500, filters: Dashboard
                 row["pct_change"],
                 row["amount"],
                 row["turnover_rate"],
+                row["observed_at"],
                 news_summary["news_count"],
                 news_summary["latest_news_time"],
                 news_summary["latest_news_title"],
@@ -1505,15 +1507,16 @@ def _render_candidates(repo: Repository, rows: list[object]) -> str:
             f"<td class=\"num\">{_fmt(row['latest_price'])}</td>"
             f"<td class=\"num\">{_fmt(row['pct_change'])}%</td>"
             f"<td class=\"num\">{_fmt_yi(row['amount'])}亿</td>"
+            f"<td>{_e(row['observed_at'] or '-')}</td>"
             f"<td>{_e(rules)}</td>"
             f"<td>{_e(news_label)}</td>"
             "</tr>"
         )
     if not body:
-        body.append('<tr><td colspan="10" class="empty">暂无候选，请先运行 run-daily。</td></tr>')
+        body.append('<tr><td colspan="11" class="empty">暂无候选，请先运行 run-daily。</td></tr>')
     return _table_section(
         "候选池",
-        ["#", "代码", "名称", "板块", "分数", "现价", "涨跌幅", "成交额", "主要理由", "消息面"],
+        ["#", "代码", "名称", "板块", "分数", "现价", "涨跌幅", "成交额", "行情时间", "主要理由", "消息面"],
         body,
     )
 
