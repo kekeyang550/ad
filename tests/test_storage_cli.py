@@ -2874,6 +2874,60 @@ class StorageCliTests(unittest.TestCase):
                 self.assertEqual(main(["--db", str(db), "ai-changes"]), 0)
             self.assertIn("changed", output.getvalue())
 
+    def test_symbol_detail_warns_when_quote_observation_lags_latest_daily_bar(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_public_quotes(
+                    [
+                        QuoteObservation(
+                            symbol="000538",
+                            name="云南白药",
+                            latest_price=58.0,
+                            pct_change=1.2,
+                            volume=18_000_000,
+                            amount=1_100_000_000,
+                            open=57.2,
+                            high=58.6,
+                            low=56.9,
+                            previous_close=57.31,
+                            observed_at="2026-07-08 10:52:47",
+                            source="test",
+                            market_cap=100_000_000_000,
+                            turnover_rate=1.8,
+                            board="深主板",
+                        )
+                    ]
+                )
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000538",
+                            trade_date=(date(2026, 6, 15) + timedelta(days=day)).isoformat(),
+                            open=55.0 + day * 0.1,
+                            high=55.5 + day * 0.1,
+                            low=54.8 + day * 0.1,
+                            close=55.2 + day * 0.1,
+                            volume=10_000_000 + day,
+                            amount=None,
+                            source_file=Path("test"),
+                        )
+                        for day in range(25)
+                    ]
+                )
+                repo.score_latest_quotes()
+                detail_html = render_symbol_detail(repo, "000538")
+                diagnose_html = render_diagnose_page(repo, "000538")
+            finally:
+                repo.close()
+
+        self.assertIn("行情过期", detail_html)
+        self.assertIn("报价 2026-07-08 / 日线 2026-07-09", detail_html)
+        self.assertIn("待补", detail_html)
+        self.assertIn("行情过期", diagnose_html)
+
     def test_ai_decision_outcomes_use_next_open_and_keep_incomplete_observations_pending(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db = Path(temp_dir) / "picker.db"

@@ -3119,13 +3119,13 @@ def _render_diagnosis_data_status(
     decision: AIDecision | None,
 ) -> str:
     latest_bar = daily_rows[0]["trade_date"] if daily_rows else "-"
-    priced = row["latest_price"] is not None and row["pct_change"] is not None
+    quote_value, quote_status = _quote_freshness_status(row, str(latest_bar) if latest_bar != "-" else "")
     factor_count = 0
     if decision is not None and isinstance(decision.evidence.get("factor_signals"), list):
         factor_count = len(decision.evidence.get("factor_signals", []))
     note_status = note["status"] if note is not None else "未记录"
     items = [
-        ("行情字段", "已补价" if priced else "缺价格", "ok" if priced else "warn"),
+        ("行情字段", quote_value, quote_status),
         ("近60日线", f"{len(daily_rows)} 根 · 最新 {latest_bar}", "ok" if len(daily_rows) >= 20 else "warn"),
         ("公式因子", f"{factor_count} 个当前信号", "ok" if factor_count else "warn"),
         ("相关新闻", f"{len(news_rows)} 条", "ok" if news_rows else "warn"),
@@ -3141,6 +3141,19 @@ def _render_diagnosis_data_status(
             "</article>"
         )
     return '<section class="panel data-status-panel"><h2>数据覆盖状态</h2><div class="metrics status-metrics">' + "".join(cards) + "</div></section>"
+
+
+def _quote_freshness_status(row: object, latest_bar_date: str) -> tuple[str, str]:
+    priced = row["latest_price"] is not None and row["pct_change"] is not None
+    if not priced:
+        return ("缺价格", "warn")
+    observed_at = str(row["observed_at"] or "").strip()
+    observed_date = _date_part(observed_at)
+    if not observed_date:
+        return ("已补价 · 未记录时间", "warn")
+    if latest_bar_date and observed_date < latest_bar_date:
+        return (f"行情过期 · 报价 {observed_date} / 日线 {latest_bar_date}", "warn")
+    return (f"已补价 · {observed_date}", "ok")
 
 
 def _render_stock_note(symbol: str, note: object | None) -> str:
@@ -3488,6 +3501,18 @@ def _thesis_evidence(raw: object) -> dict[str, object]:
 def _thesis_quote_observed_at(raw: object) -> str:
     quote_observed_at = _thesis_evidence(raw).get("quote_observed_at")
     return str(quote_observed_at) if quote_observed_at else ""
+
+
+def _date_part(value: str) -> str:
+    text = value.strip()
+    if len(text) < 10:
+        return ""
+    candidate = text[:10]
+    try:
+        datetime.strptime(candidate, "%Y-%m-%d")
+    except ValueError:
+        return ""
+    return candidate
 
 
 def _top_rules(raw: str) -> str:
