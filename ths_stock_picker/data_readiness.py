@@ -23,7 +23,32 @@ def summarize_data_readiness(
         "blocked": "关键行情或日线不满足当前研究前提，自动 AI/策略快照可能会跳过。",
     }[status]
     actions = [item for item in items if item["status"] != "ok"]
-    return {"status": status, "label": label, "summary": summary, "items": items, "actions": actions}
+    primary_action = _primary_action(actions)
+    return {
+        "status": status,
+        "label": label,
+        "summary": summary,
+        "items": items,
+        "actions": actions,
+        "primary_action": primary_action,
+    }
+
+
+def _primary_action(actions: list[dict[str, str]]) -> dict[str, str] | None:
+    if not actions:
+        return None
+    areas = {item["area"] for item in actions}
+    if "daily_bars" in areas:
+        return None
+    if areas.intersection({"quotes", "fundamentals", "industries"}):
+        return _item(
+            "prepare_data",
+            "一键准备数据",
+            "warn",
+            "可先用一条命令刷新行情、财报和行业后重新评分并生成候选日报。",
+            "python -m ths_stock_picker prepare-data --universe cache --quote-limit 3000 --fundamental-limit 100 --industry-limit 100",
+        )
+    return None
 
 
 def _daily_bar_item(health: dict[str, object]) -> dict[str, str]:

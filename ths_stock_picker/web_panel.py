@@ -1697,8 +1697,17 @@ def _render_data_health_summary(health: dict[str, object]) -> str:
 def _render_data_readiness(readiness: dict[str, object]) -> str:
     status = str(readiness.get("status") or "attention")
     pill_class = {"ready": "ok", "attention": "warn", "blocked": "warn"}.get(status, "warn")
+    primary_action = readiness.get("primary_action")
     actions = readiness.get("actions", [])
     items = []
+    if isinstance(primary_action, dict) and primary_action.get("action"):
+        items.append(
+            "<li>"
+            f"<strong>{_e(primary_action.get('label') or '-')}</strong>"
+            f"<span>{_e(primary_action.get('message') or '-')}</span>"
+            f"<code>{_e(primary_action.get('action'))}</code>"
+            "</li>"
+        )
     if isinstance(actions, list):
         for action in actions:
             if not isinstance(action, dict):
@@ -1940,6 +1949,7 @@ def _render_daily_runs(rows: list[object]) -> str:
         quote_freshness_text = _daily_run_quote_freshness_label(summary)
         fundamentals_text = _daily_run_fundamentals_label(summary)
         industries_text = _daily_run_industries_label(summary)
+        readiness_text = _daily_run_readiness_label(summary)
         ai_snapshot_text = _daily_run_ai_snapshot_label(summary)
         strategy_snapshot_text = _daily_run_strategy_snapshot_label(summary)
         announcements_text = _daily_run_public_announcements_label(summary, parameters)
@@ -1960,6 +1970,7 @@ def _render_daily_runs(rows: list[object]) -> str:
             f"<td>{_e(quote_freshness_text)}</td>"
             f"<td>{_e(fundamentals_text)}</td>"
             f"<td>{_e(industries_text)}</td>"
+            f"<td>{_e(readiness_text)}</td>"
             f"<td>{_e(ai_snapshot_text)}</td>"
             f"<td>{_e(strategy_snapshot_text)}</td>"
             f"<td>{_e(announcements_text)}</td>"
@@ -1969,10 +1980,10 @@ def _render_daily_runs(rows: list[object]) -> str:
             "</tr>"
         )
     if not body:
-        body.append('<tr><td colspan="18" class="empty">暂无每日运行记录。请先运行 run-daily。</td></tr>')
+        body.append('<tr><td colspan="19" class="empty">暂无每日运行记录。请先运行 run-daily。</td></tr>')
     return _table_section(
         "最近每日运行",
-        ["开始时间", "结束时间", "状态", "流程", "标的", "TDX 已覆盖", "TDX 同步", "公开日线", "日线时效", "行情时效", "公开财报", "公开行业", "AI 快照", "策略快照", "公告", "失败步骤", "参数", "错误"],
+        ["开始时间", "结束时间", "状态", "流程", "标的", "TDX 已覆盖", "TDX 同步", "公开日线", "日线时效", "行情时效", "公开财报", "公开行业", "准备度", "AI 快照", "策略快照", "公告", "失败步骤", "参数", "错误"],
         body,
     )
 
@@ -2035,6 +2046,13 @@ def _daily_run_quote_freshness_label(summary: dict[str, object]) -> str:
     if freshness == "empty":
         return "暂无带价格行情"
     return f"无法判断 · {latest_date} · {priced_symbols} 只"
+
+
+def _daily_run_readiness_label(summary: dict[str, object]) -> str:
+    readiness = summary.get("data_readiness")
+    if not isinstance(readiness, dict):
+        return "-"
+    return str(readiness.get("label") or readiness.get("status") or "-")
 
 
 def _daily_run_public_announcements_label(summary: dict[str, object], parameters: dict[str, object]) -> str:

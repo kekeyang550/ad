@@ -1708,6 +1708,9 @@ def _data_health(repo: Repository) -> int:
     )
     print(f"Data readiness: {readiness['status']} - {readiness['label']}")
     print(str(readiness["summary"]))
+    primary_action = readiness.get("primary_action")
+    if isinstance(primary_action, dict) and primary_action.get("action"):
+        print(f"Recommended data command: {primary_action['action']}")
     actions = readiness.get("actions", [])
     if isinstance(actions, list) and actions:
         print("Next data actions:")
@@ -2641,9 +2644,16 @@ def _daily_runs(repo: Repository, limit: int) -> int:
             summary = json.loads(row["summary_json"])
         except (TypeError, ValueError, json.JSONDecodeError):
             summary = {}
+        try:
+            parameters = json.loads(row["parameters_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parameters = {}
+        if not isinstance(parameters, dict):
+            parameters = {}
         detail = ""
         if isinstance(summary, dict):
             if row["status"] == "succeeded":
+                workflow = str(summary.get("source") or parameters.get("source") or "daily_run")
                 health = summary.get("daily_bar_health")
                 freshness = "-"
                 if isinstance(health, dict):
@@ -2661,12 +2671,19 @@ def _daily_runs(repo: Repository, limit: int) -> int:
                 strategy_snapshot_status = str(summary.get("strategy_snapshot_status") or "-")
                 strategy_snapshot_run_id = summary.get("strategy_snapshot_run_id") or "-"
                 strategy_snapshot_trades = int(summary.get("strategy_snapshot_trade_count") or 0)
+                readiness = summary.get("data_readiness")
+                readiness_status = "-"
+                if isinstance(readiness, dict):
+                    readiness_status = str(readiness.get("status") or "-")
                 detail = (
+                    f"workflow={workflow} "
                     f"history_bars={summary.get('history_bars_imported', 0)} "
                     f"history_symbols={summary.get('history_symbols', 0)} "
+                    f"quote_symbols={summary.get('quote_symbols', 0)} "
                     f"tdx_covered={summary.get('tdx_covered_symbols', 0)} "
                     f"tdx_sync_bars={summary.get('tdx_daily_bars_imported', 0)} "
                     f"daily_freshness={freshness} quote_freshness={quote_freshness} "
+                    f"readiness={readiness_status} "
                     f"ai_snapshot={ai_snapshot}:{ai_saved}:{ai_snapshot_latest_date}:{ai_snapshot_quote_freshness} "
                     f"strategy_snapshot={strategy_snapshot_status}:{strategy_snapshot_run_id}:{strategy_snapshot_trades} "
                     f"announcements={announcement_status}:{announcement_count}"

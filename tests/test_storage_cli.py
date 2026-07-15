@@ -395,6 +395,21 @@ class StorageCliTests(unittest.TestCase):
                     ]
                 )
                 partial = repo.quote_health(as_of=date(2026, 7, 13))
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date="2026-07-14",
+                            open=10.0,
+                            high=10.2,
+                            low=9.8,
+                            close=10.1,
+                            volume=1_000_000,
+                            amount=None,
+                            source_file=Path("tdx://lday/sz/sz000001.day"),
+                        )
+                    ]
+                )
                 ai_html = render_ai_page(repo)
                 data_health_html = render_data_health_page(repo)
             finally:
@@ -416,9 +431,12 @@ class StorageCliTests(unittest.TestCase):
         self.assertIn("实时行情健康", data_health_html)
         self.assertIn("数据准备度", data_health_html)
         self.assertIn("带价格行情", data_health_html)
+        self.assertIn("prepare-data", data_health_html)
         self.assertIn("import-public-quotes", data_health_html)
         self.assertIn("Realtime quote health:", output.getvalue())
         self.assertIn("Data readiness:", output.getvalue())
+        self.assertIn("Recommended data command:", output.getvalue())
+        self.assertIn("prepare-data", output.getvalue())
         self.assertIn("Next data actions:", output.getvalue())
         self.assertIn("import-public-quotes", output.getvalue())
 
@@ -544,6 +562,9 @@ class StorageCliTests(unittest.TestCase):
             observations_exists = (out_dir / "observations_prepare.csv").exists()
             candidates_exists = (out_dir / "candidates_ready.csv").exists()
             report_exists = (out_dir / "daily_report_ready.md").exists()
+            runs_output = io.StringIO()
+            with redirect_stdout(runs_output):
+                self.assertEqual(main(["--db", str(db), "daily-runs", "--limit", "1"]), 0)
 
         self.assertEqual(run["status"], "succeeded")
         self.assertEqual(summary["source"], "prepare_data")
@@ -555,7 +576,10 @@ class StorageCliTests(unittest.TestCase):
         self.assertEqual(fundamental_row["operating_cash_flow"], 14.0)
         self.assertEqual(industry["industry"], "银行")
         self.assertIn("数据准备", daily_runs_html)
+        self.assertIn("数据准备充分", daily_runs_html)
         self.assertIn("报价 2", daily_runs_html)
+        self.assertIn("workflow=prepare_data", runs_output.getvalue())
+        self.assertIn("readiness=ready", runs_output.getvalue())
         self.assertTrue(observations_exists)
         self.assertTrue(candidates_exists)
         self.assertTrue(report_exists)
