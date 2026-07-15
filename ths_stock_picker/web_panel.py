@@ -1943,17 +1943,16 @@ def _render_daily_runs(rows: list[object]) -> str:
         ai_snapshot_text = _daily_run_ai_snapshot_label(summary)
         strategy_snapshot_text = _daily_run_strategy_snapshot_label(summary)
         announcements_text = _daily_run_public_announcements_label(summary, parameters)
-        parameter_text = (
-            f"标的上限 {parameters.get('limit', '-')}，"
-            f"日线 {parameters.get('history_days', '-')} 日，"
-            f"{parameters.get('universe', '-')}"
-        )
+        workflow_text = _daily_run_workflow_label(summary, parameters)
+        parameter_text = _daily_run_parameter_label(summary, parameters)
+        symbol_count = int(summary.get("history_symbols") or summary.get("quote_symbols") or 0)
         body.append(
             "<tr>"
             f"<td>{_e(display_shanghai_time(row['started_at']))}</td>"
             f"<td>{_e(display_shanghai_time(row['finished_at']) if row['finished_at'] else '-')}</td>"
             f'<td><span class="pill {status_classes.get(status, "warn")}">{_e(status)}</span></td>'
-            f"<td class=\"num\">{int(summary.get('history_symbols') or 0)}</td>"
+            f"<td>{_e(workflow_text)}</td>"
+            f"<td class=\"num\">{symbol_count}</td>"
             f"<td class=\"num\">{int(summary.get('tdx_covered_symbols') or 0)}</td>"
             f"<td class=\"num\">{int(summary.get('tdx_daily_bars_imported') or 0):,}</td>"
             f"<td class=\"num\">{int(summary.get('history_bars_imported') or 0):,}</td>"
@@ -1970,11 +1969,34 @@ def _render_daily_runs(rows: list[object]) -> str:
             "</tr>"
         )
     if not body:
-        body.append('<tr><td colspan="17" class="empty">暂无每日运行记录。请先运行 run-daily。</td></tr>')
+        body.append('<tr><td colspan="18" class="empty">暂无每日运行记录。请先运行 run-daily。</td></tr>')
     return _table_section(
         "最近每日运行",
-        ["开始时间", "结束时间", "状态", "标的", "TDX 已覆盖", "TDX 同步", "公开日线", "日线时效", "行情时效", "公开财报", "公开行业", "AI 快照", "策略快照", "公告", "失败步骤", "参数", "错误"],
+        ["开始时间", "结束时间", "状态", "流程", "标的", "TDX 已覆盖", "TDX 同步", "公开日线", "日线时效", "行情时效", "公开财报", "公开行业", "AI 快照", "策略快照", "公告", "失败步骤", "参数", "错误"],
         body,
+    )
+
+
+def _daily_run_workflow_label(summary: dict[str, object], parameters: dict[str, object]) -> str:
+    source = str(summary.get("source") or parameters.get("source") or "")
+    if source == "prepare_data":
+        return "数据准备"
+    return "每日流水线"
+
+
+def _daily_run_parameter_label(summary: dict[str, object], parameters: dict[str, object]) -> str:
+    source = str(summary.get("source") or parameters.get("source") or "")
+    if source == "prepare_data":
+        return (
+            f"报价 {parameters.get('quote_limit', '-')}，"
+            f"财报 {parameters.get('fundamental_limit', '-')}，"
+            f"行业 {parameters.get('industry_limit', '-')}，"
+            f"{parameters.get('universe', '-')}"
+        )
+    return (
+        f"标的上限 {parameters.get('limit', '-')}，"
+        f"日线 {parameters.get('history_days', '-')} 日，"
+        f"{parameters.get('universe', '-')}"
     )
 
 

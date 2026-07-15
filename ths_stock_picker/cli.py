@@ -395,6 +395,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     public_parser.add_argument("--limit", type=int, default=200)
     public_parser.add_argument("--observations-out", type=Path, default=Path("outputs/observations_public.csv"))
+    prepare_parser = subparsers.add_parser(
+        "prepare-data",
+        help="Refresh public quotes, optional fundamentals and industries, then score and write research outputs.",
+    )
+    prepare_parser.add_argument("--universe", choices=["auto", "watchlist", "securities", "cache"], default="cache")
+    prepare_parser.add_argument("--quote-limit", type=int, default=3000)
+    prepare_parser.add_argument("--fundamental-limit", type=int, default=100)
+    prepare_parser.add_argument("--fundamental-reports", type=int, default=8)
+    prepare_parser.add_argument("--industry-limit", type=int, default=100)
+    prepare_parser.add_argument("--candidate-limit", type=int, default=30)
+    prepare_parser.add_argument("--report-limit", type=int, default=20)
+    prepare_parser.add_argument("--min-score", type=float, default=1.0)
+    prepare_parser.add_argument("--out-dir", type=Path, default=Path("outputs"))
+    prepare_parser.add_argument("--profile", type=Path, help="Optional JSON scoring profile.")
+    prepare_parser.add_argument("--skip-fundamentals", action="store_true")
+    prepare_parser.add_argument("--skip-industries", action="store_true")
+    prepare_parser.add_argument("--skip-report", action="store_true")
     universe_parser = subparsers.add_parser("universe", help="Preview symbols used for public quote fetching.")
     universe_parser.add_argument("--source", choices=["auto", "watchlist", "securities", "cache"], default="auto")
     universe_parser.add_argument("--limit", type=int, default=50)
@@ -618,6 +635,23 @@ def main(argv: list[str] | None = None) -> int:
             return _auto_observe(args.symbols, args.out)
         if args.command == "import-public-quotes":
             return _import_public_quotes(repo, args.symbols, args.from_cache, args.universe, args.limit, args.observations_out)
+        if args.command == "prepare-data":
+            return _prepare_data(
+                repo,
+                args.universe,
+                args.quote_limit,
+                args.fundamental_limit,
+                args.fundamental_reports,
+                args.industry_limit,
+                args.candidate_limit,
+                args.report_limit,
+                args.min_score,
+                args.out_dir,
+                args.profile,
+                not args.skip_fundamentals,
+                not args.skip_industries,
+                not args.skip_report,
+            )
         if args.command == "universe":
             return _universe(repo, args.source, args.limit)
         if args.command == "run-daily":
@@ -1437,6 +1471,190 @@ def _report(repo: Repository, limit: int, min_score: float, out: Path) -> int:
     return 0
 
 
+def _prepare_data(
+    repo: Repository,
+    universe: str,
+    quote_limit: int,
+    fundamental_limit: int,
+    fundamental_reports: int,
+    industry_limit: int,
+    candidate_limit: int,
+    report_limit: int,
+    min_score: float,
+    out_dir: Path,
+    profile_path: Path | None,
+    include_fundamentals: bool,
+    include_industries: bool,
+    write_report: bool,
+) -> int:
+    parameters = {
+        "source": "prepare_data",
+        "universe": universe,
+        "quote_limit": quote_limit,
+        "fundamental_limit": fundamental_limit if include_fundamentals else None,
+        "fundamental_reports": fundamental_reports if include_fundamentals else None,
+        "industry_limit": industry_limit if include_industries else None,
+        "candidate_limit": candidate_limit,
+        "report_limit": report_limit if write_report else None,
+        "min_score": min_score,
+        "out_dir": str(out_dir),
+        "profile": str(profile_path) if profile_path is not None else None,
+    }
+    run_id = repo.start_daily_run(parameters)
+    summary: dict[str, object] = {"run_id": run_id, "source": "prepare_data"}
+    current_step = "select_universe"
+    total_steps = 4 + int(include_fundamentals) + int(include_industries) + int(write_report)
+    try:
+        current_step = "select_universe"
+        source, quote_symbols = _select_universe_symbols(repo, universe, quote_limit)
+        quote_symbols = sorted(set(quote_symbols))
+        summary.update({"universe_source": source, "quote_symbols": len(quote_symbols)})
+        if not quote_symbols:
+            summary.update({"failed_step": current_step})
+            repo.finish_daily_run(run_id, "failed", summary, "no symbols selected")
+            print("No symbols selected. Import securities or realtime cache first.")
+            return 1
+
+        current_step = "import_public_quotes"
+        print(f"Step 1/{total_steps}: fetching public quotes for {len(quote_symbols)} symbols")
+        observations_path = out_dir / "observations_prepare.csv"
+        fetched_quotes, imported_quotes = _fetch_and_import_public_quotes(repo, quote_symbols, observations_path)
+        print(f"Fetched {fetched_quotes} observations -> {observations_path}")
+        print(f"Imported public quotes: {imported_quotes}")
+        summary.update(
+            {
+                "public_quote_symbols_requested": len(quote_symbols),
+                "public_quote_observations_fetched": fetched_quotes,
+                "public_quotes_imported": imported_quotes,
+            }
+        )
+        if imported_quotes == 0:
+            summary.update({"failed_step": current_step})
+            repo.finish_daily_run(run_id, "failed", summary, "no public quotes imported")
+            return 1
+
+        step = 2
+        fundamental_imported = 0
+        fundamental_failures: list[str] = []
+        if include_fundamentals:
+            current_step = "import_public_fundamentals"
+            selected = quote_symbols[: max(1, fundamental_limit)]
+            print(f"Step {step}/{total_steps}: fetching public financial reports for {len(selected)} symbols")
+            fundamental_imported, fundamental_failures = _fetch_public_fundamentals(
+                repo,
+                selected,
+                fundamental_reports,
+            )
+            print(f"Fetched public financial records: {fundamental_imported}")
+            if fundamental_failures:
+                print(f"Public financial fetch failures: {len(fundamental_failures)} ({'; '.join(fundamental_failures[:5])})")
+            summary.update(
+                {
+                    "public_fundamentals_enabled": True,
+                    "public_fundamental_symbols_requested": len(selected),
+                    "public_fundamentals_imported": fundamental_imported,
+                    "public_fundamentals_failures": len(fundamental_failures),
+                    "public_fundamentals_failure_samples": fundamental_failures[:5],
+                }
+            )
+            step += 1
+        else:
+            summary["public_fundamentals_enabled"] = False
+
+        industry_imported = 0
+        industry_failures: list[str] = []
+        if include_industries:
+            current_step = "import_public_industries"
+            refresh_symbols = repo.industry_refresh_symbols(quote_symbols, industry_limit)
+            print(f"Step {step}/{total_steps}: fetching public industry labels for {len(refresh_symbols)} symbols")
+            industry_imported, industry_failures = _fetch_public_industries(repo, refresh_symbols)
+            print(f"Imported public industry labels: {industry_imported}")
+            if industry_failures:
+                print(f"Public industry fetch failures: {len(industry_failures)} ({'; '.join(industry_failures[:5])})")
+            summary.update(
+                {
+                    "public_industries_enabled": True,
+                    "public_industry_symbols_requested": len(refresh_symbols),
+                    "public_industries_imported": industry_imported,
+                    "public_industries_failures": len(industry_failures),
+                    "public_industries_failure_samples": industry_failures[:5],
+                }
+            )
+            step += 1
+        else:
+            summary["public_industries_enabled"] = False
+
+        current_step = "score"
+        print(f"Step {step}/{total_steps}: scoring")
+        score_code = _score(repo, profile_path)
+        summary["score_return_code"] = score_code
+        step += 1
+
+        current_step = "write_candidates"
+        candidates_path = out_dir / "candidates_ready.csv"
+        print(f"Step {step}/{total_steps}: writing candidate CSV")
+        candidate_count = repo.write_candidates_csv(candidates_path, limit=candidate_limit, min_score=min_score)
+        print(f"Wrote {candidate_count} candidates -> {candidates_path}")
+        summary["candidates_written"] = candidate_count
+        artifacts = [str(observations_path), str(candidates_path)]
+        step += 1
+
+        if write_report:
+            current_step = "write_report"
+            report_path = out_dir / "daily_report_ready.md"
+            print(f"Step {step}/{total_steps}: writing daily report")
+            report_count = repo.write_daily_report(report_path, limit=report_limit, min_score=min_score)
+            print(f"Wrote daily report with {report_count} candidates -> {report_path}")
+            summary["daily_report_candidates"] = report_count
+            artifacts.append(str(report_path))
+            step += 1
+
+        health = repo.daily_bar_health()
+        quote_health = repo.quote_health()
+        fundamental_health = repo.fundamental_health()
+        industry_health = repo.industry_health()
+        readiness = summarize_data_readiness(health, quote_health, fundamental_health, industry_health)
+        summary.update(
+            {
+                "artifacts": artifacts,
+                "table_counts": repo.table_counts(),
+                "daily_bar_health": {
+                    "status": health["status"],
+                    "latest_trade_date": health["latest_trade_date"],
+                    "freshness_status": health["freshness_status"],
+                    "weekday_lag_days": health["weekday_lag_days"],
+                    "freshness_checked_on": health["freshness_checked_on"],
+                },
+                "quote_health": {
+                    "priced_symbols": quote_health["priced_symbols"],
+                    "current_priced_symbols": quote_health["current_priced_symbols"],
+                    "stale_priced_symbols": quote_health["stale_priced_symbols"],
+                    "latest_price_date": quote_health["latest_price_date"],
+                    "freshness_status": quote_health["freshness_status"],
+                    "weekday_lag_days": quote_health["weekday_lag_days"],
+                    "freshness_checked_on": quote_health["freshness_checked_on"],
+                },
+                "fundamental_health": fundamental_health,
+                "industry_health": industry_health,
+                "data_readiness": {
+                    "status": readiness["status"],
+                    "label": readiness["label"],
+                    "summary": readiness["summary"],
+                    "actions": readiness["actions"],
+                },
+            }
+        )
+        repo.finish_daily_run(run_id, "succeeded", summary)
+        print(f"Data readiness: {readiness['status']} - {readiness['label']}")
+        print(str(readiness["summary"]))
+        print(f"Saved prepare-data run: {run_id}")
+        return 0
+    except Exception as error:
+        summary["failed_step"] = current_step
+        repo.finish_daily_run(run_id, "failed", summary, f"{type(error).__name__}: {error}")
+        raise
+
+
 def _db_info(repo: Repository) -> int:
     for table, count in repo.table_counts().items():
         print(f"{table}: {count}")
@@ -1923,12 +2141,17 @@ def _import_public_quotes(
     if not selected:
         print("No symbols provided. Pass symbols or use --from-cache after running import.")
         return 1
-    observations = fetch_tencent_observations(selected)
-    imported = repo.upsert_public_quotes(observations)
-    write_observations_csv(observations_out, observations)
-    print(f"Fetched {len(observations)} observations -> {observations_out}")
+    fetched, imported = _fetch_and_import_public_quotes(repo, selected, observations_out)
+    print(f"Fetched {fetched} observations -> {observations_out}")
     print(f"Imported public quotes: {imported}")
     return 0 if imported else 1
+
+
+def _fetch_and_import_public_quotes(repo: Repository, symbols: list[str], observations_out: Path) -> tuple[int, int]:
+    observations = fetch_tencent_observations(symbols)
+    imported = repo.upsert_public_quotes(observations)
+    write_observations_csv(observations_out, observations)
+    return len(observations), imported
 
 
 def _select_universe_symbols(repo: Repository, universe: str, limit: int | None) -> tuple[str, list[str]]:

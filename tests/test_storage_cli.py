@@ -422,6 +422,148 @@ class StorageCliTests(unittest.TestCase):
         self.assertIn("Next data actions:", output.getvalue())
         self.assertIn("import-public-quotes", output.getvalue())
 
+    def test_prepare_data_refreshes_quotes_scores_outputs_and_records_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / "picker.db"
+            out_dir = root / "outputs"
+
+            def observation(symbol: str, name: str, price: float) -> QuoteObservation:
+                return QuoteObservation(
+                    symbol=symbol,
+                    name=name,
+                    latest_price=price,
+                    pct_change=1.5,
+                    volume=20_000_000,
+                    amount=300_000_000,
+                    open=price - 0.2,
+                    high=price + 0.3,
+                    low=price - 0.4,
+                    previous_close=price - 0.5,
+                    observed_at="2026-07-15 15:05:00",
+                    source="test",
+                    market_cap=100_000_000_000,
+                    turnover_rate=1.2,
+                    board="测试板块",
+                )
+
+            def fundamental(symbol: str, reports: int) -> list[FundamentalRecord]:
+                return [
+                    FundamentalRecord(
+                        symbol=symbol,
+                        report_date="2026-03-31",
+                        notice_date="2026-04-25",
+                        revenue=100.0,
+                        net_profit=12.0,
+                        roe=8.5,
+                        operating_cash_flow=14.0,
+                        pe_ttm=None,
+                        pb=None,
+                        source_file=Path("public"),
+                        revenue_yoy=5.0,
+                        net_profit_yoy=4.0,
+                    )
+                ]
+
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.insert_quotes(
+                    [
+                        QuoteRealtime("600000", "浦发银行", "sh", None, None, None, None),
+                        QuoteRealtime("000001", "平安银行", "sz", None, None, None, None),
+                    ]
+                )
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol=symbol,
+                            trade_date="2026-07-15",
+                            open=10.0,
+                            high=10.5,
+                            low=9.8,
+                            close=10.2,
+                            volume=1_000_000,
+                            amount=None,
+                            source_file=Path("tdx://lday/test.day"),
+                        )
+                        for symbol in ("600000", "000001")
+                    ]
+                )
+            finally:
+                repo.close()
+
+            output = io.StringIO()
+            with (
+                patch(
+                    "ths_stock_picker.cli.fetch_tencent_observations",
+                    return_value=[
+                        observation("600000", "浦发银行", 12.0),
+                        observation("000001", "平安银行", 10.0),
+                    ],
+                ) as quotes_mock,
+                patch("ths_stock_picker.cli.fetch_eastmoney_fundamentals_one", side_effect=fundamental) as fundamentals_mock,
+                patch(
+                    "ths_stock_picker.cli.fetch_eastmoney_industry_one",
+                    side_effect=lambda symbol: IndustryClassification(symbol, "银行"),
+                ) as industries_mock,
+                redirect_stdout(output),
+            ):
+                self.assertEqual(
+                    main(
+                        [
+                            "--db",
+                            str(db),
+                            "prepare-data",
+                            "--universe",
+                            "cache",
+                            "--quote-limit",
+                            "2",
+                            "--fundamental-limit",
+                            "2",
+                            "--industry-limit",
+                            "2",
+                            "--out-dir",
+                            str(out_dir),
+                        ]
+                    ),
+                    0,
+                )
+
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                run = repo.daily_runs(limit=1)[0]
+                summary = json.loads(run["summary_json"])
+                candidates = repo.latest_candidates(limit=5)
+                fundamental_row = repo.latest_fundamental("600000")
+                industry = repo.industry_for_symbol("600000")
+                daily_runs_html = render_daily_runs_page(repo)
+            finally:
+                repo.close()
+            observations_exists = (out_dir / "observations_prepare.csv").exists()
+            candidates_exists = (out_dir / "candidates_ready.csv").exists()
+            report_exists = (out_dir / "daily_report_ready.md").exists()
+
+        self.assertEqual(run["status"], "succeeded")
+        self.assertEqual(summary["source"], "prepare_data")
+        self.assertEqual(summary["public_quotes_imported"], 2)
+        self.assertEqual(summary["public_fundamentals_imported"], 2)
+        self.assertEqual(summary["public_industries_imported"], 2)
+        self.assertEqual(summary["data_readiness"]["status"], "ready")
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(fundamental_row["operating_cash_flow"], 14.0)
+        self.assertEqual(industry["industry"], "银行")
+        self.assertIn("数据准备", daily_runs_html)
+        self.assertIn("报价 2", daily_runs_html)
+        self.assertTrue(observations_exists)
+        self.assertTrue(candidates_exists)
+        self.assertTrue(report_exists)
+        quotes_mock.assert_called_once()
+        self.assertEqual(fundamentals_mock.call_count, 2)
+        self.assertEqual(industries_mock.call_count, 2)
+        self.assertIn("Saved prepare-data run", output.getvalue())
+
     def test_fundamental_health_counts_only_reports_disclosed_before_the_as_of_date(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db = Path(temp_dir) / "picker.db"
