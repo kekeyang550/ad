@@ -43,7 +43,7 @@ def load_ths_news_xml(path: Path, limit: int | None = None) -> list[NewsItem]:
         summary = properties.get("summ", "")
         source = properties.get("source", "")
         importance = _to_int(properties.get("imp"))
-        tags = ",".join(_classify_news(title, summary))
+        tags = ",".join(classify_news(title, summary))
         if not title:
             continue
         rows.append(
@@ -134,7 +134,7 @@ def _eastmoney_announcements_from_payload(payload: str, requested_symbol: str) -
         event_time = _clean_eastmoney_time(row.get("display_time") or row.get("notice_date") or row.get("sort_date"))
         summary_parts = [part for part in [code_text, column_text, art_code] if part]
         summary = "；".join(summary_parts)
-        tags = _classify_news(title, summary)
+        tags = classify_news(title, summary)
         if "公告" not in tags:
             tags.append("公告")
         items.append(
@@ -237,17 +237,43 @@ def _fallback_news_id(title: str) -> str:
     return str(abs(hash(title)))
 
 
-def _classify_news(title: str, summary: str) -> list[str]:
+def classify_news(title: str, summary: str) -> list[str]:
     text = f"{title} {summary}"
+    performance_recovery = bool(
+        re.search(
+            r"预计[^。；;]{0,120}(?:净利润|盈利)[^。；;]{0,120}(?:上年同期|去年同期)[^。；;]{0,24}亏损",
+            text,
+        )
+    )
+    performance_risk = bool(
+        re.search(
+            r"业绩预亏|预计[^。；;]{0,16}(?:净亏损|亏损|下降|减少|由盈转亏)|同比.{0,6}下降|由盈转亏|首亏|续亏|业绩下修|净利润.{0,16}(?:下降|减少|亏损)|营收.{0,16}(?:下降|减少)",
+            text,
+        )
+    ) and not performance_recovery
+    performance_positive = performance_recovery or bool(
+        re.search(
+            r"业绩预增|预计[^。；;]{0,16}(?:增长|盈利)|同比.{0,6}增长|扭亏为盈|由亏转盈|业绩上修|净利润.{0,16}(?:增长|提升)|营收.{0,16}(?:增长|提升)",
+            text,
+        )
+    )
     rules = [
-        ("退市风险", r"退市|强制退市|重大违法|ST|立案调查|行政处罚"),
-        ("业绩预告", r"预计|预告|净利润|同比增长|同比下降|扭亏|亏损"),
-        ("并购投资", r"收购|并购|对外投资|项目投资|股权|重组|购买资产"),
-        ("政策监管", r"监管|证监会|交易所|政策|管理局|违法|立案|处罚"),
+        ("退市风险", r"退市|强制退市|重大违法|风险警示|立案调查|行政处罚"),
+        ("业绩预告", r"业绩预告|业绩快报|年度报告|半年度报告|季度报告"),
+        ("减持质押", r"减持|股权质押|质押.{0,12}(风险|平仓)|强制平仓"),
+        ("回购增持", r"回购|增持"),
+        ("中标订单", r"中标|重大合同|签订.{0,16}合同|订单"),
+        ("并购投资", r"收购|并购|对外投资|项目投资|资产重组|购买资产|发行股份"),
+        ("政策监管", r"监管问询|监管措施|警示函|纪律处分|公开谴责|证监会.{0,16}(调查|处罚|立案)|交易所.{0,16}(问询|监管|处分)"),
         ("AI算力", r"AI|算力|服务器|芯片|半导体|机器人|存储"),
         ("消费", r"消费|补贴|旅游|食品|饮料"),
         ("新能源", r"新能源|光伏|储能|电池|锂|充电"),
         ("公告", r"公告|公司称|表示"),
     ]
-    tags = [label for label, pattern in rules if re.search(pattern, text, re.IGNORECASE)]
+    tags: list[str] = []
+    if performance_risk:
+        tags.append("业绩风险")
+    if performance_positive:
+        tags.append("业绩利好")
+    tags.extend(label for label, pattern in rules if re.search(pattern, text, re.IGNORECASE))
     return tags or ["资讯"]

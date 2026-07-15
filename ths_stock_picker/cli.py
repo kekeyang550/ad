@@ -16,7 +16,7 @@ from .field_inference import (
     write_capture,
 )
 from .history_import import fetch_tencent_daily_bars, load_daily_bars_csv
-from .news_import import fetch_eastmoney_announcements, load_default_ths_news
+from .news_import import classify_news, fetch_eastmoney_announcements, load_default_ths_news
 from .public_industries import fetch_eastmoney_industry_one
 from .quote_observer import fetch_tencent_observations, write_observations_csv
 from .scoring_profile import load_scoring_profile, write_default_scoring_profile
@@ -78,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     news_parser.add_argument("--limit", type=int, default=30)
     news_parser.add_argument("--q", default="")
     news_parser.add_argument("--tag", default="")
+    subparsers.add_parser("reclassify-news", help="Rebuild imported news tags with the current deterministic classifier.")
     subparsers.add_parser("factors", help="Show formula-inspired factor definitions.")
     factor_scan_parser = subparsers.add_parser("factor-scan", help="Scan latest daily bars for formula-inspired factor signals.")
     factor_scan_parser.add_argument("--limit", type=int, default=50)
@@ -484,6 +485,8 @@ def main(argv: list[str] | None = None) -> int:
             return _import_public_announcements(repo, args.symbols, args.universe, args.limit, args.per_symbol, args.timeout)
         if args.command == "news":
             return _news(repo, args.limit, args.q, args.tag)
+        if args.command == "reclassify-news":
+            return _reclassify_news(repo)
         if args.command == "factors":
             return _factors()
         if args.command == "factor-scan":
@@ -736,6 +739,12 @@ def _news(repo: Repository, limit: int, query: str, tag: str) -> int:
         print(f"{row['event_time'] or '-'} {row['title']} [{row['tags']}] {row['source'] or '-'}")
         if row["summary"]:
             print(f"   {row['summary'][:120]}")
+    return 0
+
+
+def _reclassify_news(repo: Repository) -> int:
+    updated = repo.reclassify_news_tags(classify_news)
+    print(f"Reclassified news tags: {updated}")
     return 0
 
 

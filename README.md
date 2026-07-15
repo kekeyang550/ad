@@ -34,6 +34,7 @@ python -m ths_stock_picker ths-monitor
 python -m ths_stock_picker import-ths-news
 python -m ths_stock_picker import-public-announcements 000538 --per-symbol 3
 python -m ths_stock_picker import-public-announcements --universe auto --limit 30 --per-symbol 3
+python -m ths_stock_picker reclassify-news
 python -m ths_stock_picker news --limit 20
 python -m ths_stock_picker news --tag AI算力
 python -m ths_stock_picker factors
@@ -269,11 +270,11 @@ python -m ths_stock_picker news --limit 20
 python -m ths_stock_picker news --tag AI算力
 ```
 
-新闻会被打上初步事件标签，例如业绩预告、退市风险、并购投资、AI算力、消费、新能源、政策监管和公告。普通投资者关系、董事会会议等公开公告默认只作为“公告”证据，不直接当作风险或利好；退市、立案、处罚、并购重组等关键词才会影响 AI 风险/正向新闻信号。AI 选股会优先匹配个股相关新闻；没有直接个股新闻时，会按板块/名称补充主题新闻作为辅助证据。`run-daily` 可加 `--public-announcements --public-announcement-limit 30 --public-announcements-per-symbol 3` 同步当日股票池公告；公开公告网络失败时会写入每日记录，但不会阻断行情、评分和导出。
+新闻会被打上确定性事件标签，例如业绩利好、业绩风险、减持质押、回购增持、中标订单、退市风险、并购投资、AI算力、消费、新能源、政策监管和公告；普通业绩预告、定期报告、投资者关系和董事会会议保持中性。AI 只将明确利好计入正向消息、将明确风险计入风险消息，不再把“预亏”或“同比下降”误判为催化。已入库的旧资讯可用 `reclassify-news` 一次重标。AI 选股会优先匹配个股相关新闻；没有直接个股新闻时，会按板块/名称补充主题新闻作为辅助证据。`run-daily` 可加 `--public-announcements --public-announcement-limit 30 --public-announcements-per-symbol 3` 同步当日股票池公告；公开公告网络失败时会写入每日记录，但不会阻断行情、评分和导出。
 
 `report` 和每日流程生成的 `daily_report.md` 会在候选榜中附加“消息面”列，显示每只候选的相关新闻数量与最新标题，便于盘后快速筛掉需要先读公告的标的。
 
-`candidates` 命令和首页“导出 CSV”也会附加 `news_count`、`latest_news_time`、`latest_news_title`、`latest_news_tags` 和 `latest_news_source` 字段，方便在 Excel/WPS 里筛选有公告或业绩预告的候选。
+`candidates` 命令和首页“导出 CSV”也会附加 `news_count`、`latest_news_time`、`latest_news_title`、`latest_news_tags` 和 `latest_news_source` 字段，方便在 Excel/WPS 里筛选公告、业绩利好和业绩风险候选。
 
 命令行：
 

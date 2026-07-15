@@ -1545,7 +1545,7 @@ def _render_scores(rows: list[object]) -> str:
 
 
 def _render_news_filters(query: str, tag: str, limit: int) -> str:
-    tag_options = ["", "业绩预告", "退市风险", "并购投资", "AI算力", "政策监管", "消费", "新能源", "公告"]
+    tag_options = ["", "业绩利好", "业绩风险", "业绩预告", "减持质押", "回购增持", "中标订单", "退市风险", "并购投资", "AI算力", "政策监管", "消费", "新能源", "公告"]
     options = "".join(
         f'<option value="{_e(item)}"{" selected" if item == tag else ""}>{_e(item or "全部标签")}</option>'
         for item in tag_options

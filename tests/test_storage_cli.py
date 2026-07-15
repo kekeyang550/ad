@@ -10,11 +10,11 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from ths_stock_picker.ai_decision import AIDecision, analyze_symbol, rank_candidates
+from ths_stock_picker.ai_decision import AIDecision, analyze_symbol, rank_candidates, summarize_news_signal
 from ths_stock_picker.cli import DAILY_STRATEGY_SNAPSHOT_OPTIONS, main
 from ths_stock_picker.fundamentals import FundamentalRecord
 from ths_stock_picker.history_import import DailyBar
-from ths_stock_picker.news_import import fetch_eastmoney_announcements, load_ths_news_xml
+from ths_stock_picker.news_import import classify_news, fetch_eastmoney_announcements, load_ths_news_xml
 from ths_stock_picker.public_industries import IndustryClassification
 from ths_stock_picker.quote_observer import QuoteObservation
 from ths_stock_picker.storage import SQLITE_BUSY_TIMEOUT_SECONDS, Repository, assess_strategy_walk_forward, summarize_ai_decision_outcomes
@@ -2004,6 +2004,51 @@ class StorageCliTests(unittest.TestCase):
                 repo.close()
 
         self.assertEqual(rows[0]["title"], "云南白药:2026年7月10日调研活动附件之投资者调研会议记录")
+
+    def test_reclassify_news_separates_performance_risk_from_positive_catalysts(self) -> None:
+        self.assertIn("业绩风险", classify_news("公司发布业绩预亏，净利润同比下降", ""))
+        self.assertNotIn("业绩利好", classify_news("公司发布业绩预亏，净利润同比下降", ""))
+        self.assertIn("业绩利好", classify_news("公司发布业绩预增，预计净利润增长", ""))
+        recovery_tags = classify_news(
+            "渤海租赁：预计上半年净利润30亿元-36亿元",
+            "预计2026年上半年净利润30亿元到36亿元，上年同期亏损20.19亿元。",
+        )
+        self.assertIn("业绩利好", recovery_tags)
+        self.assertNotIn("业绩风险", recovery_tags)
+        self.assertIn("业绩风险", classify_news("公司预计净亏损4亿元", "上年同期亏损1亿元。"))
+        self.assertIn("减持质押", classify_news("控股股东拟减持公司股份", ""))
+        self.assertNotIn("政策监管", classify_news("公司受益于促消费政策", ""))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_news_items(
+                    [
+                        NewsItem("risk", "平安银行：业绩预亏，净利润同比下降", "000001 平安银行", "测试", None, None, "业绩预告", Path("test")),
+                        NewsItem("positive", "平安银行：业绩预增，预计净利润增长", "000001 平安银行", "测试", None, None, "业绩预告", Path("test")),
+                        NewsItem("neutral", "平安银行：投资者关系活动记录表", "000001 平安银行", "测试", None, None, "业绩预告", Path("test")),
+                    ]
+                )
+            finally:
+                repo.close()
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(main(["--db", str(db), "reclassify-news"]), 0)
+
+            repo = Repository(db)
+            try:
+                rows = {str(row["news_id"]): row for row in repo.latest_news(limit=10)}
+            finally:
+                repo.close()
+
+        self.assertIn("业绩风险", rows["risk"]["tags"])
+        self.assertIn("业绩利好", rows["positive"]["tags"])
+        self.assertEqual(rows["neutral"]["tags"], "资讯")
+        self.assertEqual(summarize_news_signal([rows["risk"], rows["positive"], rows["neutral"]]), {"positive": 1.0, "risk": 1.0})
+        self.assertIn("Reclassified news tags: 3", output.getvalue())
 
     def test_import_public_announcements_cli_populates_news_table(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

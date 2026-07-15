@@ -44,7 +44,7 @@ def analyze_symbol(repo: Any, symbol: str) -> AIDecision | None:
     rules = json.loads(row["triggered_rules_json"])
     trend = _trend_metrics(bars)
     factor_quality = _factor_quality_map(repo)
-    news_signal = _news_signal(news)
+    news_signal = summarize_news_signal(news)
     decision = _decision_label(row, components, rules, trend, note, news_signal)
     strengths = _strengths(row, components, rules, trend, note, news, factor_signals, factor_quality)
     risks = _risks(row, components, rules, trend, note, news, factor_signals, factor_quality)
@@ -52,7 +52,7 @@ def analyze_symbol(repo: Any, symbol: str) -> AIDecision | None:
     invalidation_conditions = _invalidation_conditions(decision, row, trend)
     next_actions = _next_actions(decision, row, trend, risks, note)
     confidence = _confidence(row, components, trend, note, news, factor_signals, factor_quality)
-    summary = _summary(row, decision, confidence, strengths, risks, trend, news)
+    summary = _summary(row, decision, confidence, strengths, risks, trend, news, news_signal)
 
     return AIDecision(
         symbol=row["symbol"],
@@ -187,7 +187,7 @@ def _strengths(
             break
     for item in news:
         tags = item["tags"] or ""
-        if any(token in tags for token in ("业绩预告", "并购投资", "AI算力", "新能源", "消费")):
+        if any(token in tags for token in ("业绩利好", "回购增持", "中标订单", "并购投资", "AI算力", "新能源", "消费")):
             items.append(f"消息催化：{item['title']}")
             break
     if not items:
@@ -224,7 +224,7 @@ def _risks(
         items.append("本地观察状态已标记为回避")
     for item in news:
         tags = item["tags"] or ""
-        if any(token in tags for token in ("退市风险", "政策监管")):
+        if any(token in tags for token in ("退市风险", "业绩风险", "减持质押", "政策监管")):
             items.append(f"风险消息：{item['title']}")
             break
     for signal in factor_signals:
@@ -345,6 +345,7 @@ def _summary(
     risks: list[str],
     trend: dict[str, float | None],
     news: list[Any],
+    news_signal: dict[str, float],
 ) -> str:
     score = float(row["total_score"] or 0.0)
     name = row["name"] or row["symbol"]
@@ -354,6 +355,8 @@ def _summary(
     if trend.get("ma5") is not None and trend.get("ma20") is not None:
         trend_text = f"，MA5 {float(trend['ma5']):.2f} / MA20 {float(trend['ma20']):.2f}"
     news_text = f"相关新闻 {len(news)} 条。" if news else "暂无匹配相关新闻。"
+    if news:
+        news_text += f"其中明确利好 {int(news_signal['positive'])} 条、明确风险 {int(news_signal['risk'])} 条。"
     return (
         f"{name} 当前 AI 结论为“{decision}”，置信度 {confidence:.0f}。"
         f"综合评分 {score:.2f}，涨跌幅 {pct_text}{trend_text}。"
@@ -373,14 +376,14 @@ def _risk_score(components: dict[str, float], rules: list[str], trend: dict[str,
     return risk
 
 
-def _news_signal(news: list[Any]) -> dict[str, float]:
+def summarize_news_signal(news: list[Any]) -> dict[str, float]:
     positive = 0.0
     risk = 0.0
     for item in news:
         tags = item["tags"] or ""
-        if any(token in tags for token in ("业绩预告", "并购投资", "AI算力", "新能源", "消费")):
+        if any(token in tags for token in ("业绩利好", "回购增持", "中标订单", "并购投资", "AI算力", "新能源", "消费")):
             positive += 1
-        if any(token in tags for token in ("退市风险", "政策监管")):
+        if any(token in tags for token in ("退市风险", "业绩风险", "减持质押", "政策监管")):
             risk += 1
     return {"positive": positive, "risk": risk}
 

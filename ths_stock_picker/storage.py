@@ -7,6 +7,7 @@ import hashlib
 import math
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Callable
 
 from .factor_engine import FACTOR_ENGINE_VERSION, FactorSignal, evaluate_disclosed_fundamental, evaluate_factors, factor_definitions
 from .fundamentals import FundamentalRecord
@@ -2966,6 +2967,19 @@ class Repository:
             """,
             tuple(params),
         ).fetchall()
+
+    def reclassify_news_tags(self, classifier: Callable[[str, str], list[str]]) -> int:
+        rows = self.conn.execute("SELECT news_id, title, summary, tags FROM news_items").fetchall()
+        updates = []
+        for row in rows:
+            tags = ",".join(classifier(str(row["title"] or ""), str(row["summary"] or "")))
+            if tags != str(row["tags"] or ""):
+                updates.append((tags, row["news_id"]))
+        if not updates:
+            return 0
+        with self.conn:
+            self.conn.executemany("UPDATE news_items SET tags = ? WHERE news_id = ?", updates)
+        return len(updates)
 
     def related_news_for_symbol(self, symbol: str, name: str | None = None, limit: int = 5) -> list[sqlite3.Row]:
         security_name = name or self._security_name(symbol) or ""
