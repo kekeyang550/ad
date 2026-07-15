@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from .ai_decision import AIDecision, analyze_symbol, decisions_to_rows, rank_candidates
+from .data_readiness import summarize_data_readiness
 from .factor_engine import factor_definitions
 from .storage import DEFAULT_DB_PATH, Repository, summarize_ai_decision_outcomes
 from .ths_local import DEFAULT_THS_ROOT
@@ -477,10 +478,12 @@ def render_data_health_page(repo: Repository) -> str:
     quote_health = repo.quote_health()
     fundamental_health = repo.fundamental_health()
     industry_health = repo.industry_health()
+    readiness = summarize_data_readiness(health, quote_health, fundamental_health, industry_health)
     return _page(
         "日线数据健康",
         [
             _topbar("数据健康", "检查日线来源、实时行情、财务披露与当前行业归属覆盖", back_link="/"),
+            _render_data_readiness(readiness),
             _render_data_health_summary(health),
             _render_data_health_sources(health),
             _render_quote_health(quote_health),
@@ -1689,6 +1692,39 @@ def _render_data_health_summary(health: dict[str, object]) -> str:
         '<article class="metric">' + f"<span>{_e(label)}</span><strong>{_e(value)}</strong>" + "</article>"
         for label, value in cards
     ) + "</section>" + note
+
+
+def _render_data_readiness(readiness: dict[str, object]) -> str:
+    status = str(readiness.get("status") or "attention")
+    pill_class = {"ready": "ok", "attention": "warn", "blocked": "warn"}.get(status, "warn")
+    actions = readiness.get("actions", [])
+    items = []
+    if isinstance(actions, list):
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            command = str(action.get("action") or "")
+            command_html = f"<code>{_e(command)}</code>" if command else ""
+            items.append(
+                "<li>"
+                f"<strong>{_e(action.get('label') or '-')}</strong>"
+                f"<span>{_e(action.get('message') or '-')}</span>"
+                f"{command_html}"
+                "</li>"
+            )
+    if not items:
+        items.append("<li><strong>全部</strong><span>当前核心数据满足候选、诊股和复盘的基础要求。</span></li>")
+    return (
+        '<section class="panel readiness-panel">'
+        '<div class="panel-heading-inline">'
+        "<h2>数据准备度</h2>"
+        f'<span class="pill {pill_class}">{_e(readiness.get("label") or status)}</span>'
+        "</div>"
+        f"<p>{_e(readiness.get('summary') or '')}</p>"
+        '<ul class="readiness-list">'
+        + "".join(items)
+        + "</ul></section>"
+    )
 
 
 def _render_quote_health(health: dict[str, object]) -> str:
@@ -3677,6 +3713,13 @@ p { margin: 8px 0 0; color: #5f6c7b; font-size: 13px; line-height: 1.7; text-wra
 .compact-metric em { width: fit-content; font-style: normal; }
 .wide-metric strong { font-size: 15px; line-height: 1.35; overflow-wrap: anywhere; }
 .panel { background: #ffffff; border: 1px solid #d8e0e8; border-radius: 8px; padding: 16px; margin-top: 14px; }
+.panel-heading-inline { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.panel-heading-inline h2 { margin: 0; }
+.readiness-list { display: grid; gap: 10px; margin: 12px 0 0; padding: 0; list-style: none; }
+.readiness-list li { display: grid; grid-template-columns: minmax(90px, 140px) minmax(0, 1fr); gap: 8px 12px; align-items: start; padding-top: 10px; border-top: 1px solid #e6edf3; }
+.readiness-list strong { color: #1f2933; }
+.readiness-list span { color: #334155; line-height: 1.55; }
+.readiness-list code { grid-column: 2; display: block; white-space: normal; overflow-wrap: anywhere; color: #075985; background: #e0f2fe; border-radius: 6px; padding: 6px 8px; }
 .filter-panel { padding: 12px 16px; }
 .filters { display: grid; grid-template-columns: minmax(160px, 1.4fr) repeat(3, minmax(120px, 1fr)) auto auto; gap: 10px; align-items: end; }
 .filters label { display: grid; gap: 5px; color: #52616f; font-size: 12px; font-weight: 700; }
@@ -3797,6 +3840,8 @@ td:last-child { white-space: normal; min-width: 220px; }
   .filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .ai-grid { grid-template-columns: 1fr; }
   .note-form { grid-template-columns: 1fr; }
+  .readiness-list li { grid-template-columns: 1fr; }
+  .readiness-list code { grid-column: 1; }
   .topbar { align-items: flex-start; flex-direction: column; }
   h1 { font-size: 24px; }
 }

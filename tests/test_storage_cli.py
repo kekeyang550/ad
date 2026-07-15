@@ -414,8 +414,13 @@ class StorageCliTests(unittest.TestCase):
         self.assertEqual(partial["stale_priced_symbols"], 1)
         self.assertIn("行情时效提醒", ai_html)
         self.assertIn("实时行情健康", data_health_html)
+        self.assertIn("数据准备度", data_health_html)
         self.assertIn("带价格行情", data_health_html)
+        self.assertIn("import-public-quotes", data_health_html)
         self.assertIn("Realtime quote health:", output.getvalue())
+        self.assertIn("Data readiness:", output.getvalue())
+        self.assertIn("Next data actions:", output.getvalue())
+        self.assertIn("import-public-quotes", output.getvalue())
 
     def test_fundamental_health_counts_only_reports_disclosed_before_the_as_of_date(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

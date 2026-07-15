@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .ai_decision import analyze_symbol, decisions_to_rows, rank_candidates
+from .data_readiness import summarize_data_readiness
 from .factor_engine import factor_definitions
 from .fundamentals import fetch_eastmoney_fundamentals_one, load_fundamentals_csv
 from .field_inference import (
@@ -1447,6 +1448,7 @@ def _data_health(repo: Repository) -> int:
     quote_health = repo.quote_health()
     fundamental_health = repo.fundamental_health()
     industry_health = repo.industry_health()
+    readiness = summarize_data_readiness(health, quote_health, fundamental_health, industry_health)
     print(f"Daily bar health: {health['status']}")
     print(f"Canonical source precedence: {health['canonical_source_policy']}")
     print(f"Bars: {health['total_bars']}  Symbols: {health['total_symbols']}")
@@ -1486,6 +1488,16 @@ def _data_health(repo: Repository) -> int:
         f"score_date={industry_health['score_date'] or '-'} "
         f"latest_updated_at={industry_health['latest_updated_at'] or '-'}"
     )
+    print(f"Data readiness: {readiness['status']} - {readiness['label']}")
+    print(str(readiness["summary"]))
+    actions = readiness.get("actions", [])
+    if isinstance(actions, list) and actions:
+        print("Next data actions:")
+        for item in actions:
+            if isinstance(item, dict):
+                action = str(item.get("action") or "")
+                suffix = f" | {action}" if action else ""
+                print(f"- [{item.get('status', '-')}] {item.get('label', '-')}: {item.get('message', '-')}{suffix}")
     return 0
 
 
