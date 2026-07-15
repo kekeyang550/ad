@@ -91,7 +91,11 @@ def render_dashboard(repo: Repository, limit: int = 30, filters: DashboardFilter
     snapshots = repo.latest_snapshots(limit=12)
     latest_run = repo.latest_score_runs(1)
     quote_coverage = repo.latest_score_quote_coverage()
+    daily_bar_health = repo.daily_bar_health()
     quote_health = repo.quote_health()
+    fundamental_health = repo.fundamental_health()
+    industry_health = repo.industry_health()
+    readiness = summarize_data_readiness(daily_bar_health, quote_health, fundamental_health, industry_health)
     profile_note = f" · 当前评分 {latest_run[0]['profile_name']}" if latest_run else ""
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -119,7 +123,7 @@ def render_dashboard(repo: Repository, limit: int = 30, filters: DashboardFilter
             _render_daily_data_freshness_notice(repo),
             _render_quote_freshness_notice(repo),
             _render_ai_candidate_availability(quote_coverage, bool(candidates)),
-            _render_dashboard_guide(counts, quote_health, len(candidates), len(run_changes)),
+            _render_dashboard_guide(readiness, len(candidates), len(run_changes)),
             _render_counts(counts),
             _render_filters(active_filters),
             _render_candidates(repo, candidates),
@@ -1185,21 +1189,14 @@ def _render_counts(counts: dict[str, int]) -> str:
 
 
 def _render_dashboard_guide(
-    counts: dict[str, int],
-    quote_health: dict[str, object],
+    readiness: dict[str, object],
     candidate_count: int,
     change_count: int,
 ) -> str:
-    has_daily_bars = counts.get("daily_bars", 0) > 0
-    has_priced_quotes = int(quote_health.get("priced_symbols") or 0) > 0
-    if has_daily_bars and has_priced_quotes:
-        status_text, status_class = "数据已接入", "ok"
-    elif has_daily_bars:
-        status_text, status_class = "行情待补齐", "warn"
-    elif has_priced_quotes:
-        status_text, status_class = "日线待补齐", "warn"
-    else:
-        status_text, status_class = "等待数据", "warn"
+    readiness_status = str(readiness.get("status") or "attention")
+    status_text = str(readiness.get("label") or readiness_status)
+    status_class = "ok" if readiness_status == "ready" else "warn"
+    primary_action = readiness.get("primary_action")
     steps = [
         ("1", "数据更新", "确认同花顺缓存、行情、日线和新闻是否可用", "/ths"),
         ("2", "AI 选股", "查看当前候选、结论、正向证据和风险点", "/ai"),
@@ -1216,14 +1213,18 @@ def _render_dashboard_guide(
             "<small>" + _e(text) + "</small>"
             "</a>"
         )
+    data_action = '<a class="refresh" href="/data-health">查看数据健康</a>'
+    if isinstance(primary_action, dict) and primary_action.get("action"):
+        data_action = '<a class="refresh" href="/data-health">准备数据</a>'
     return (
         '<section class="hero-panel">'
         '<div class="hero-copy">'
         '<span class="eyebrow">A 股 AI 选股工作台</span>'
         "<h2>从真实数据出发，先筛选，再验证，最后复盘。</h2>"
-        "<p>当前面板把同花顺本地数据、公开行情、公式型因子、新闻消息和策略回测放在同一条决策链里。</p>"
+        f"<p>{_e(readiness.get('summary') or '当前面板把同花顺本地数据、公开行情、公式型因子、新闻消息和策略回测放在同一条决策链里。')}</p>"
         '<div class="hero-actions">'
         '<a class="refresh primary-action" href="/ai">查看 AI 选股</a>'
+        f"{data_action}"
         '<a class="refresh" href="/backtest">运行策略回测</a>'
         '<a class="refresh" href="/factors">验证因子</a>'
         "</div>"

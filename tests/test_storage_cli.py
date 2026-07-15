@@ -556,6 +556,7 @@ class StorageCliTests(unittest.TestCase):
                 candidates = repo.latest_candidates(limit=5)
                 fundamental_row = repo.latest_fundamental("600000")
                 industry = repo.industry_for_symbol("600000")
+                dashboard_html = render_dashboard(repo)
                 daily_runs_html = render_daily_runs_page(repo)
             finally:
                 repo.close()
@@ -575,6 +576,8 @@ class StorageCliTests(unittest.TestCase):
         self.assertEqual(len(candidates), 2)
         self.assertEqual(fundamental_row["operating_cash_flow"], 14.0)
         self.assertEqual(industry["industry"], "银行")
+        self.assertIn("数据准备充分", dashboard_html)
+        self.assertIn("查看数据健康", dashboard_html)
         self.assertIn("数据准备", daily_runs_html)
         self.assertIn("数据准备充分", daily_runs_html)
         self.assertIn("报价 2", daily_runs_html)
@@ -682,7 +685,7 @@ class StorageCliTests(unittest.TestCase):
 
         for page in pages:
             self.assertIn("日线时效提醒", page)
-        self.assertIn("行情待补齐", dashboard_html)
+        self.assertIn("关键数据不足", dashboard_html)
 
     def test_strategy_backtest_next_open_execution_uses_matching_benchmark_window(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
