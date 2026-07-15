@@ -2258,6 +2258,22 @@ def _save_daily_ai_snapshot(repo: Repository, limit: int) -> dict[str, object]:
             "ai_snapshot_daily_bar_freshness": freshness,
             "ai_snapshot_latest_trade_date": latest_trade_date,
         }
+    quote_health = repo.quote_health()
+    quote_freshness = str(quote_health.get("freshness_status") or "unknown")
+    latest_price_date = str(quote_health.get("latest_price_date") or "-")
+    if quote_freshness != "current":
+        print(
+            f"AI snapshot skipped: quotes freshness={quote_freshness} "
+            f"latest_price_date={latest_price_date}"
+        )
+        return {
+            "ai_snapshot_status": "skipped_stale_quotes",
+            "ai_decisions_saved": 0,
+            "ai_snapshot_quote_freshness": quote_freshness,
+            "ai_snapshot_latest_price_date": latest_price_date,
+            "ai_snapshot_current_priced_symbols": int(quote_health.get("current_priced_symbols") or 0),
+            "ai_snapshot_priced_symbols": int(quote_health.get("priced_symbols") or 0),
+        }
     decisions = rank_candidates(repo, limit=min(30, limit), min_score=1.0)
     saved_ai_decisions = (
         repo.insert_ai_decisions(decisions_to_rows(decisions), replace_same_signal=True) if decisions else 0
@@ -2391,6 +2407,7 @@ def _daily_runs(repo: Repository, limit: int) -> int:
                 ai_snapshot = str(summary.get("ai_snapshot_status") or "-")
                 ai_saved = int(summary.get("ai_decisions_saved") or 0)
                 ai_snapshot_latest_date = str(summary.get("ai_snapshot_latest_trade_date") or "-")
+                ai_snapshot_quote_freshness = str(summary.get("ai_snapshot_quote_freshness") or "-")
                 announcement_status = str(summary.get("public_announcement_status") or "-")
                 announcement_count = int(summary.get("public_announcements_imported") or 0)
                 strategy_snapshot_status = str(summary.get("strategy_snapshot_status") or "-")
@@ -2402,7 +2419,7 @@ def _daily_runs(repo: Repository, limit: int) -> int:
                     f"tdx_covered={summary.get('tdx_covered_symbols', 0)} "
                     f"tdx_sync_bars={summary.get('tdx_daily_bars_imported', 0)} "
                     f"daily_freshness={freshness} quote_freshness={quote_freshness} "
-                    f"ai_snapshot={ai_snapshot}:{ai_saved}:{ai_snapshot_latest_date} "
+                    f"ai_snapshot={ai_snapshot}:{ai_saved}:{ai_snapshot_latest_date}:{ai_snapshot_quote_freshness} "
                     f"strategy_snapshot={strategy_snapshot_status}:{strategy_snapshot_run_id}:{strategy_snapshot_trades} "
                     f"announcements={announcement_status}:{announcement_count}"
                 )

@@ -1975,6 +1975,18 @@ def _daily_run_ai_snapshot_label(summary: dict[str, object]) -> str:
         if freshness == "empty":
             return "暂无日线，未保存"
         return f"日线状态 {freshness}，未保存"
+    if status == "skipped_stale_quotes":
+        freshness = str(summary.get("ai_snapshot_quote_freshness") or "unknown")
+        latest_date = str(summary.get("ai_snapshot_latest_price_date") or "-")
+        current_symbols = int(summary.get("ai_snapshot_current_priced_symbols") or 0)
+        priced_symbols = int(summary.get("ai_snapshot_priced_symbols") or 0)
+        if freshness == "partial":
+            return f"行情部分过期（近 1 日 {current_symbols}/{priced_symbols} 只），未保存"
+        if freshness == "lagging":
+            return f"行情滞后至 {latest_date}，未保存"
+        if freshness == "empty":
+            return "暂无带价格行情，未保存"
+        return f"行情状态 {freshness}，未保存"
     return "-"
 
 

@@ -1163,12 +1163,31 @@ class StorageCliTests(unittest.TestCase):
             "freshness_checked_on": "2026-07-15",
         }
         stale_daily_bars = {**healthy_daily_bars, "latest_trade_date": "2026-07-08", "freshness_status": "lagging", "weekday_lag_days": 5}
+        healthy_quotes = {
+            "priced_symbols": 1,
+            "current_priced_symbols": 1,
+            "stale_priced_symbols": 0,
+            "latest_price_date": "2026-07-15",
+            "freshness_status": "current",
+            "weekday_lag_days": 0,
+            "freshness_checked_on": "2026-07-15",
+        }
+        partial_quotes = {
+            "priced_symbols": 2,
+            "current_priced_symbols": 1,
+            "stale_priced_symbols": 1,
+            "latest_price_date": "2026-07-15",
+            "freshness_status": "partial",
+            "weekday_lag_days": 0,
+            "freshness_checked_on": "2026-07-15",
+        }
         scenarios = [
-            ("saved", healthy_daily_bars, {"return_value": [decision]}, 1),
-            ("failed", healthy_daily_bars, {"side_effect": RuntimeError("AI unavailable")}, 0),
-            ("skipped_stale_daily_bars", stale_daily_bars, {"return_value": [decision]}, 0),
+            ("saved", healthy_daily_bars, healthy_quotes, {"return_value": [decision]}, 1),
+            ("failed", healthy_daily_bars, healthy_quotes, {"side_effect": RuntimeError("AI unavailable")}, 0),
+            ("skipped_stale_daily_bars", stale_daily_bars, healthy_quotes, {"return_value": [decision]}, 0),
+            ("skipped_stale_quotes", healthy_daily_bars, partial_quotes, {"return_value": [decision]}, 0),
         ]
-        for expected_status, daily_bar_health, rank_patch, expected_rows in scenarios:
+        for expected_status, daily_bar_health, quote_health, rank_patch, expected_rows in scenarios:
             with self.subTest(status=expected_status), tempfile.TemporaryDirectory() as temp_dir:
                 root = Path(temp_dir)
                 db = root / "picker.db"
@@ -1179,6 +1198,7 @@ class StorageCliTests(unittest.TestCase):
                     patch("ths_stock_picker.cli._select_universe_symbols", return_value=("test", [])),
                     patch("ths_stock_picker.cli._export", return_value=0),
                     patch.object(Repository, "daily_bar_health", return_value=daily_bar_health),
+                    patch.object(Repository, "quote_health", return_value=quote_health),
                     patch("ths_stock_picker.cli.rank_candidates", **rank_patch) as rank_mock,
                     redirect_stdout(output),
                 ):
@@ -1219,6 +1239,11 @@ class StorageCliTests(unittest.TestCase):
                     self.assertEqual(summary["ai_snapshot_latest_trade_date"], "2026-07-08")
                     self.assertIn("日线滞后至 2026-07-08，未保存", html)
                     self.assertIn("AI snapshot skipped: daily bars freshness=lagging", output.getvalue())
+                elif expected_status == "skipped_stale_quotes":
+                    rank_mock.assert_not_called()
+                    self.assertEqual(summary["ai_snapshot_quote_freshness"], "partial")
+                    self.assertIn("行情部分过期（近 1 日 1/2 只），未保存", html)
+                    self.assertIn("AI snapshot skipped: quotes freshness=partial", output.getvalue())
 
     def test_run_daily_optionally_saves_a_non_blocking_strategy_snapshot(self) -> None:
         snapshot_result = {
