@@ -45,6 +45,19 @@ DAILY_AUDIT_EXPORT_TABLES = [
     "daily_runs",
 ]
 
+DAILY_STRATEGY_SNAPSHOT_OPTIONS: dict[str, object] = {
+    "horizon_days": 5,
+    "top_n": 10,
+    "min_signal_score": 60.0,
+    "limit_symbols": 300,
+    "cost_bps": 5.0,
+    "slippage_bps": 5.0,
+    "benchmark_symbol": "sh000300",
+    "max_bars": 260,
+    "execution_mode": "next_open",
+    "position_mode": "non_overlapping",
+}
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ths-picker")
@@ -435,6 +448,11 @@ def main(argv: list[str] | None = None) -> int:
     daily_parser.add_argument("--public-announcements", action="store_true", help="Also import public Eastmoney announcements for the daily universe.")
     daily_parser.add_argument("--public-announcement-limit", type=int, default=30)
     daily_parser.add_argument("--public-announcements-per-symbol", type=int, default=3)
+    daily_parser.add_argument(
+        "--strategy-snapshot",
+        action="store_true",
+        help="Also save a conservative, reproducible research strategy backtest after scoring. Failures do not block the daily update.",
+    )
     daily_runs_parser = subparsers.add_parser("daily-runs", help="List saved daily pipeline runs and failures.")
     daily_runs_parser.add_argument("--limit", type=int, default=20)
     serve_parser = subparsers.add_parser("serve", help="Start a read-only local web dashboard.")
@@ -619,6 +637,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.public_announcements,
                 args.public_announcement_limit,
                 args.public_announcements_per_symbol,
+                args.strategy_snapshot,
             )
         if args.command == "daily-runs":
             return _daily_runs(repo, args.limit)
@@ -1951,6 +1970,7 @@ def _run_daily(
     public_announcements: bool = False,
     public_announcement_limit: int = 30,
     public_announcements_per_symbol: int = 3,
+    strategy_snapshot: bool = False,
 ) -> int:
     parameters = {
         "limit": limit,
@@ -1970,6 +1990,7 @@ def _run_daily(
         "public_announcements": public_announcements,
         "public_announcement_limit": public_announcement_limit,
         "public_announcements_per_symbol": public_announcements_per_symbol,
+        "strategy_snapshot": strategy_snapshot,
     }
     run_id = repo.start_daily_run(parameters)
     summary: dict[str, object] = {"run_id": run_id}
@@ -1978,6 +1999,7 @@ def _run_daily(
         + int(public_fundamentals)
         + int(public_industries)
         + int(public_announcements)
+        + int(strategy_snapshot)
         + int(tdx_root is not None)
         + int(tdx_root is not None and tdx_import_themes)
     )
@@ -2147,6 +2169,21 @@ def _run_daily(
             )
             print(f"AI snapshot skipped: {type(error).__name__}: {error}")
 
+        if strategy_snapshot:
+            current_step = "save_strategy_snapshot"
+            next_step += 1
+            print(f"Step {next_step}/{total_steps}: saving strategy research snapshot")
+            try:
+                summary.update(_save_daily_strategy_snapshot(repo))
+            except Exception as error:
+                summary.update(
+                    {
+                        "strategy_snapshot_status": "failed",
+                        "strategy_snapshot_error": f"{type(error).__name__}: {error}",
+                    }
+                )
+                print(f"Strategy snapshot skipped: {type(error).__name__}: {error}")
+
         current_step = "export"
         next_step += 1
         print(f"Step {next_step}/{total_steps}: exporting")
@@ -2205,6 +2242,28 @@ def _run_daily(
         summary["failed_step"] = current_step
         repo.finish_daily_run(run_id, "failed", summary, f"{type(error).__name__}: {error}")
         raise
+
+
+def _save_daily_strategy_snapshot(repo: Repository) -> dict[str, object]:
+    options = dict(DAILY_STRATEGY_SNAPSHOT_OPTIONS)
+    result = repo.strategy_backtest(**options)
+    parameters = {**options, "source": "daily_run_strategy_snapshot"}
+    saved_run_id = repo.save_strategy_backtest_run(parameters, result)
+    trade_count = int(result.get("trade_count") or 0)
+    portfolio_avg_return = result.get("portfolio_avg_return")
+    max_drawdown = result.get("max_drawdown")
+    print(
+        f"Saved strategy snapshot: run={saved_run_id} trades={trade_count} "
+        f"portfolio_avg={_fmt_number(portfolio_avg_return)}% max_dd={_fmt_number(max_drawdown)}%"
+    )
+    return {
+        "strategy_snapshot_enabled": True,
+        "strategy_snapshot_status": "saved",
+        "strategy_snapshot_run_id": saved_run_id,
+        "strategy_snapshot_trade_count": trade_count,
+        "strategy_snapshot_portfolio_avg_return": portfolio_avg_return,
+        "strategy_snapshot_max_drawdown": max_drawdown,
+    }
 
 
 def _sync_tdx_daily_bars(
@@ -2294,6 +2353,9 @@ def _daily_runs(repo: Repository, limit: int) -> int:
                 ai_saved = int(summary.get("ai_decisions_saved") or 0)
                 announcement_status = str(summary.get("public_announcement_status") or "-")
                 announcement_count = int(summary.get("public_announcements_imported") or 0)
+                strategy_snapshot_status = str(summary.get("strategy_snapshot_status") or "-")
+                strategy_snapshot_run_id = summary.get("strategy_snapshot_run_id") or "-"
+                strategy_snapshot_trades = int(summary.get("strategy_snapshot_trade_count") or 0)
                 detail = (
                     f"history_bars={summary.get('history_bars_imported', 0)} "
                     f"history_symbols={summary.get('history_symbols', 0)} "
@@ -2301,6 +2363,7 @@ def _daily_runs(repo: Repository, limit: int) -> int:
                     f"tdx_sync_bars={summary.get('tdx_daily_bars_imported', 0)} "
                     f"daily_freshness={freshness} quote_freshness={quote_freshness} "
                     f"ai_snapshot={ai_snapshot}:{ai_saved} "
+                    f"strategy_snapshot={strategy_snapshot_status}:{strategy_snapshot_run_id}:{strategy_snapshot_trades} "
                     f"announcements={announcement_status}:{announcement_count}"
                 )
             else:

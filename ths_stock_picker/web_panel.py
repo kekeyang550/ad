@@ -1844,6 +1844,7 @@ def _render_daily_runs(rows: list[object]) -> str:
         fundamentals_text = _daily_run_fundamentals_label(summary)
         industries_text = _daily_run_industries_label(summary)
         ai_snapshot_text = _daily_run_ai_snapshot_label(summary)
+        strategy_snapshot_text = _daily_run_strategy_snapshot_label(summary)
         announcements_text = _daily_run_public_announcements_label(summary, parameters)
         parameter_text = (
             f"标的上限 {parameters.get('limit', '-')}，"
@@ -1864,6 +1865,7 @@ def _render_daily_runs(rows: list[object]) -> str:
             f"<td>{_e(fundamentals_text)}</td>"
             f"<td>{_e(industries_text)}</td>"
             f"<td>{_e(ai_snapshot_text)}</td>"
+            f"<td>{_e(strategy_snapshot_text)}</td>"
             f"<td>{_e(announcements_text)}</td>"
             f"<td>{_e(summary.get('failed_step') or '-')}</td>"
             f"<td>{_e(parameter_text)}</td>"
@@ -1871,10 +1873,10 @@ def _render_daily_runs(rows: list[object]) -> str:
             "</tr>"
         )
     if not body:
-        body.append('<tr><td colspan="16" class="empty">暂无每日运行记录。请先运行 run-daily。</td></tr>')
+        body.append('<tr><td colspan="17" class="empty">暂无每日运行记录。请先运行 run-daily。</td></tr>')
     return _table_section(
         "最近每日运行",
-        ["开始时间", "结束时间", "状态", "标的", "TDX 已覆盖", "TDX 同步", "公开日线", "日线时效", "行情时效", "公开财报", "公开行业", "AI 快照", "公告", "失败步骤", "参数", "错误"],
+        ["开始时间", "结束时间", "状态", "标的", "TDX 已覆盖", "TDX 同步", "公开日线", "日线时效", "行情时效", "公开财报", "公开行业", "AI 快照", "策略快照", "公告", "失败步骤", "参数", "错误"],
         body,
     )
 
@@ -1965,6 +1967,23 @@ def _daily_run_ai_snapshot_label(summary: dict[str, object]) -> str:
         return "无可保存候选"
     if status == "failed":
         return "生成失败，不影响数据更新"
+    return "-"
+
+
+def _daily_run_strategy_snapshot_label(summary: dict[str, object]) -> str:
+    if not summary.get("strategy_snapshot_enabled") and "strategy_snapshot_status" not in summary:
+        return "未启用"
+    status = str(summary.get("strategy_snapshot_status") or "unknown")
+    if status == "saved":
+        run_id = summary.get("strategy_snapshot_run_id")
+        trades = int(summary.get("strategy_snapshot_trade_count") or 0)
+        average_return = summary.get("strategy_snapshot_portfolio_avg_return")
+        parts = [f"#{run_id}" if run_id is not None else "已保存", f"{trades} 笔"]
+        if average_return is not None:
+            parts.append(f"组合 {float(average_return):+.2f}%")
+        return "已保存 " + " · ".join(parts)
+    if status == "failed":
+        return "失败，不影响数据更新"
     return "-"
 
 

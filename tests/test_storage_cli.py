@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ths_stock_picker.ai_decision import AIDecision, analyze_symbol, rank_candidates
-from ths_stock_picker.cli import main
+from ths_stock_picker.cli import DAILY_STRATEGY_SNAPSHOT_OPTIONS, main
 from ths_stock_picker.fundamentals import FundamentalRecord
 from ths_stock_picker.history_import import DailyBar
 from ths_stock_picker.news_import import fetch_eastmoney_announcements, load_ths_news_xml
@@ -1201,6 +1201,74 @@ class StorageCliTests(unittest.TestCase):
                 if expected_status == "failed":
                     self.assertIn("RuntimeError: AI unavailable", summary["ai_snapshot_error"])
                     self.assertIn("AI snapshot skipped", output.getvalue())
+
+    def test_run_daily_optionally_saves_a_non_blocking_strategy_snapshot(self) -> None:
+        snapshot_result = {
+            "trade_count": 12,
+            "portfolio_avg_return": 1.25,
+            "max_drawdown": -4.5,
+        }
+        scenarios = [("saved", {"return_value": snapshot_result}), ("failed", {"side_effect": RuntimeError("backtest unavailable")})]
+        for expected_status, backtest_patch in scenarios:
+            with self.subTest(status=expected_status), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                db = root / "picker.db"
+                ths_root = make_fake_ths(root)
+                output = io.StringIO()
+                with (
+                    patch("ths_stock_picker.cli._import_public_quotes", return_value=0),
+                    patch("ths_stock_picker.cli._select_universe_symbols", return_value=("test", [])),
+                    patch("ths_stock_picker.cli._export", return_value=0),
+                    patch.object(Repository, "strategy_backtest", **backtest_patch) as backtest_mock,
+                    patch.object(Repository, "save_strategy_backtest_run", return_value=42) as save_mock,
+                    redirect_stdout(output),
+                ):
+                    self.assertEqual(
+                        main(
+                            [
+                                "--db",
+                                str(db),
+                                "--ths-root",
+                                str(ths_root),
+                                "run-daily",
+                                "--limit",
+                                "1",
+                                "--strategy-snapshot",
+                                "--out-dir",
+                                str(root / "outputs"),
+                            ]
+                        ),
+                        0,
+                    )
+
+                repo = Repository(db)
+                try:
+                    repo.init_schema()
+                    run = repo.daily_runs(limit=1)[0]
+                    summary = json.loads(run["summary_json"])
+                    parameters = json.loads(run["parameters_json"])
+                    html = render_daily_runs_page(repo)
+                finally:
+                    repo.close()
+
+                self.assertEqual(run["status"], "succeeded")
+                self.assertTrue(parameters["strategy_snapshot"])
+                self.assertEqual(summary["strategy_snapshot_status"], expected_status)
+                self.assertIn("策略快照", html)
+                if expected_status == "saved":
+                    self.assertEqual(summary["strategy_snapshot_run_id"], 42)
+                    self.assertEqual(summary["strategy_snapshot_trade_count"], 12)
+                    self.assertAlmostEqual(summary["strategy_snapshot_portfolio_avg_return"], 1.25)
+                    backtest_mock.assert_called_once_with(**DAILY_STRATEGY_SNAPSHOT_OPTIONS)
+                    saved_parameters = save_mock.call_args.args[0]
+                    self.assertEqual(saved_parameters["source"], "daily_run_strategy_snapshot")
+                    self.assertIn("已保存 #42 · 12 笔 · 组合 +1.25%", html)
+                    self.assertIn("Saved strategy snapshot", output.getvalue())
+                else:
+                    save_mock.assert_not_called()
+                    self.assertIn("RuntimeError: backtest unavailable", summary["strategy_snapshot_error"])
+                    self.assertIn("失败，不影响数据更新", html)
+                    self.assertIn("Strategy snapshot skipped", output.getvalue())
 
     def test_run_daily_public_announcements_failure_is_non_blocking(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
