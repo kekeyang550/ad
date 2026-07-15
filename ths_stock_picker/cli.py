@@ -1441,6 +1441,7 @@ def _db_info(repo: Repository) -> int:
 
 def _data_health(repo: Repository) -> int:
     health = repo.daily_bar_health()
+    quote_health = repo.quote_health()
     fundamental_health = repo.fundamental_health()
     industry_health = repo.industry_health()
     print(f"Daily bar health: {health['status']}")
@@ -1459,6 +1460,15 @@ def _data_health(repo: Repository) -> int:
             f"{row['source_kind']}: bars={row['bars']} symbols={row['symbols']} "
             f"range={row['first_trade_date'] or '-'}..{row['last_trade_date'] or '-'}"
         )
+    print(
+        "Realtime quote health: "
+        f"freshness={quote_health['freshness_status']} "
+        f"priced_symbols={quote_health['priced_symbols']} "
+        f"current_priced_symbols={quote_health['current_priced_symbols']} "
+        f"stale_priced_symbols={quote_health['stale_priced_symbols']} "
+        f"latest_price_date={quote_health['latest_price_date'] or '-'} "
+        f"checked_on={quote_health['freshness_checked_on']}"
+    )
     print(
         "Financial disclosure health: "
         f"records={fundamental_health['total_records']} symbols={fundamental_health['total_symbols']} "

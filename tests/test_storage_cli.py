@@ -396,8 +396,13 @@ class StorageCliTests(unittest.TestCase):
                 )
                 partial = repo.quote_health(as_of=date(2026, 7, 13))
                 ai_html = render_ai_page(repo)
+                data_health_html = render_data_health_page(repo)
             finally:
                 repo.close()
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(main(["--db", str(db), "data-health"]), 0)
 
         self.assertEqual(empty["freshness_status"], "empty")
         self.assertEqual(current["freshness_status"], "current")
@@ -408,6 +413,9 @@ class StorageCliTests(unittest.TestCase):
         self.assertEqual(partial["current_priced_symbols"], 1)
         self.assertEqual(partial["stale_priced_symbols"], 1)
         self.assertIn("行情时效提醒", ai_html)
+        self.assertIn("实时行情健康", data_health_html)
+        self.assertIn("带价格行情", data_health_html)
+        self.assertIn("Realtime quote health:", output.getvalue())
 
     def test_fundamental_health_counts_only_reports_disclosed_before_the_as_of_date(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

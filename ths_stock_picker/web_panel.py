@@ -457,14 +457,16 @@ def render_ths_monitor_page(ths_root: Path = DEFAULT_THS_ROOT) -> str:
 
 def render_data_health_page(repo: Repository) -> str:
     health = repo.daily_bar_health()
+    quote_health = repo.quote_health()
     fundamental_health = repo.fundamental_health()
     industry_health = repo.industry_health()
     return _page(
         "日线数据健康",
         [
-            _topbar("数据健康", "检查日线来源、财务披露与当前行业归属覆盖", back_link="/"),
+            _topbar("数据健康", "检查日线来源、实时行情、财务披露与当前行业归属覆盖", back_link="/"),
             _render_data_health_summary(health),
             _render_data_health_sources(health),
+            _render_quote_health(quote_health),
             _render_fundamental_health(fundamental_health),
             _render_industry_health(industry_health),
         ],
@@ -1667,6 +1669,45 @@ def _render_data_health_summary(health: dict[str, object]) -> str:
         '<article class="metric">' + f"<span>{_e(label)}</span><strong>{_e(value)}</strong>" + "</article>"
         for label, value in cards
     ) + "</section>" + note
+
+
+def _render_quote_health(health: dict[str, object]) -> str:
+    freshness = str(health.get("freshness_status") or "unknown")
+    priced_symbols = int(health.get("priced_symbols") or 0)
+    current_symbols = int(health.get("current_priced_symbols") or 0)
+    stale_symbols = int(health.get("stale_priced_symbols") or 0)
+    status_label = {
+        "current": "近 1 个工作日",
+        "partial": "部分过期",
+        "lagging": "整体滞后",
+        "empty": "暂无行情",
+        "unknown": "无法判断",
+    }.get(freshness, freshness)
+    latest_date = str(health.get("latest_price_date") or "-")
+    checked_on = str(health.get("freshness_checked_on") or "-")
+    if freshness == "current":
+        note_text = f"带价格行情 {priced_symbols} 只，均在近 1 个工作日内刷新。"
+    elif freshness == "partial":
+        note_text = f"带价格行情 {priced_symbols} 只，其中 {current_symbols} 只近 1 个工作日已刷新，{stale_symbols} 只可能过期。"
+    elif freshness == "lagging":
+        note_text = f"最近带价格行情为 {latest_date}，按工作日粗略估算已整体滞后。"
+    elif freshness == "empty":
+        note_text = "暂无带价格行情；评分和自动 AI 快照不会形成可用的当日价格样本。"
+    else:
+        note_text = "行情时间字段不完整，无法确认价格时效。"
+    cards = [
+        ("时效状态", status_label),
+        ("带价格行情", f"{priced_symbols:,} 只"),
+        ("近 1 个工作日", f"{current_symbols:,} / {priced_symbols:,} 只"),
+        ("可能过期", f"{stale_symbols:,} 只"),
+        ("最近价格日期", latest_date),
+        ("检查日期", checked_on),
+    ]
+    metrics = "".join(
+        '<article class="metric"><span>' + _e(label) + "</span><strong>" + _e(value) + "</strong></article>"
+        for label, value in cards
+    )
+    return '<section class="panel"><h2>实时行情健康</h2><p>' + _e(note_text) + "</p></section>" + '<section class="metrics">' + metrics + "</section>"
 
 
 def _render_data_health_sources(health: dict[str, object]) -> str:
