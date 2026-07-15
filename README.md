@@ -272,7 +272,7 @@ python -m ths_stock_picker news --tag AI算力
 
 新闻会被打上确定性事件标签，例如业绩利好、业绩风险、减持质押、回购增持、中标订单、退市风险、并购投资、AI算力、消费、新能源、政策监管和公告；普通业绩预告、定期报告、投资者关系和董事会会议保持中性。AI 只将明确利好计入正向消息、将明确风险计入风险消息，不再把“预亏”或“同比下降”误判为催化。已入库的旧资讯可用 `reclassify-news` 一次重标。AI 选股会优先匹配个股相关新闻；没有直接个股新闻时，会按板块/名称补充主题新闻作为辅助证据。`run-daily` 可加 `--public-announcements --public-announcement-limit 30 --public-announcements-per-symbol 3` 同步当日股票池公告；公开公告网络失败时会写入每日记录，但不会阻断行情、评分和导出。
 
-`report` 和每日流程生成的 `daily_report.md` 会在候选榜中附加“行情时间”和“消息面”列：前者是单只报价观测时间，后者显示相关新闻数量与最新标题，便于盘后先筛掉报价过期、或需要先读公告的标的。
+`report` 和每日流程生成的 `daily_report.md` 会在头部附加日线和实时行情的整体时效摘要，并在候选榜中附加“行情时间”和“消息面”列：前者是单只报价观测时间，后者显示相关新闻数量与最新标题，便于盘后先判断整份数据是否过期，再筛掉单只报价过期、或需要先读公告的标的。
 
 `candidates` 命令和首页“导出 CSV”也会附加 `quote_observed_at`、`news_count`、`latest_news_time`、`latest_news_title`、`latest_news_tags` 和 `latest_news_source` 字段；首页候选池、AI 榜单、已保存 AI 历史和个股诊断都会展示单只股票的行情时间。每条新保存 AI 观点会把该时间写入 thesis，个股详情会列出最近 5 条已保存观点，便于在 Excel/WPS 或页面内筛掉报价过期的候选；旧观点缺少该字段时显示 `-`。
 

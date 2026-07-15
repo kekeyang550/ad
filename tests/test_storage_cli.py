@@ -3128,6 +3128,8 @@ class StorageCliTests(unittest.TestCase):
             self.assertNotIn("*ST康佳A", candidates_text)
             report_text = report_path.read_text(encoding="utf-8")
             self.assertIn("# A 股选股日报", report_text)
+            self.assertIn("日线时效: 暂无日线", report_text)
+            self.assertIn("实时行情时效:", report_text)
             self.assertIn("行情时间", report_text)
             self.assertIn("2026-07-08 10:52:47", report_text)
             self.assertIn("单只报价观测时间", report_text)

@@ -3253,6 +3253,8 @@ class Repository:
         rows = self.latest_candidates(limit=limit, min_score=min_score)
         counts = self.table_counts()
         industry_heat = self.industry_heat(limit=5, min_scored=2)
+        daily_bar_health = self.daily_bar_health()
+        quote_health = self.quote_health()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         lines = [
             "# A 股选股日报",
@@ -3263,6 +3265,8 @@ class Repository:
             f"- 实时行情记录: {counts['quotes_realtime']}",
             f"- 评分记录: {counts['scores']}",
             f"- 已导入行业归属: {counts['stock_industries']}",
+            f"- 日线时效: {_daily_report_daily_bar_freshness(daily_bar_health)}",
+            f"- 实时行情时效: {_daily_report_quote_freshness(quote_health)}",
             "",
             "## 候选榜",
             "",
@@ -3337,6 +3341,37 @@ def _daily_report_news_summary(rows: list[sqlite3.Row]) -> str:
     if len(latest) > 38:
         latest = latest[:35] + "..."
     return f"{len(rows)}条：{latest}"
+
+
+def _daily_report_daily_bar_freshness(health: dict[str, object]) -> str:
+    latest_date = str(health.get("latest_trade_date") or "-")
+    freshness = str(health.get("freshness_status") or "unknown")
+    lag_days = health.get("weekday_lag_days")
+    if freshness == "current":
+        return f"近 1 个工作日（最近股票日线 {latest_date}）"
+    if freshness == "lagging":
+        return f"可能滞后 {lag_days if lag_days is not None else '-'} 个工作日（最近股票日线 {latest_date}）"
+    if freshness == "empty":
+        return "暂无日线"
+    return f"无法判断（最近股票日线 {latest_date}）"
+
+
+def _daily_report_quote_freshness(health: dict[str, object]) -> str:
+    latest_date = str(health.get("latest_price_date") or "-")
+    freshness = str(health.get("freshness_status") or "unknown")
+    priced_symbols = int(health.get("priced_symbols") or 0)
+    current_symbols = int(health.get("current_priced_symbols") or 0)
+    stale_symbols = int(health.get("stale_priced_symbols") or 0)
+    lag_days = health.get("weekday_lag_days")
+    if freshness == "current":
+        return f"近 1 个工作日（带价格 {priced_symbols} 只，最近价格日期 {latest_date}）"
+    if freshness == "partial":
+        return f"部分过期（近 1 个工作日 {current_symbols}/{priced_symbols} 只，可能过期 {stale_symbols} 只，最近价格日期 {latest_date}）"
+    if freshness == "lagging":
+        return f"可能滞后 {lag_days if lag_days is not None else '-'} 个工作日（带价格 {priced_symbols} 只，最近价格日期 {latest_date}）"
+    if freshness == "empty":
+        return "暂无带价格行情"
+    return f"无法判断（带价格 {priced_symbols} 只，最近价格日期 {latest_date}）"
 
 
 def _news_export_summary(rows: list[sqlite3.Row]) -> dict[str, object]:
