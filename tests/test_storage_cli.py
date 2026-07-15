@@ -12,11 +12,14 @@ from unittest.mock import patch
 
 from ths_stock_picker.ai_decision import AIDecision, analyze_symbol, rank_candidates
 from ths_stock_picker.cli import main
+from ths_stock_picker.fundamentals import FundamentalRecord
 from ths_stock_picker.history_import import DailyBar
 from ths_stock_picker.news_import import fetch_eastmoney_announcements, load_ths_news_xml
+from ths_stock_picker.public_industries import IndustryClassification
 from ths_stock_picker.quote_observer import QuoteObservation
-from ths_stock_picker.storage import Repository, assess_strategy_walk_forward, summarize_ai_decision_outcomes
+from ths_stock_picker.storage import SQLITE_BUSY_TIMEOUT_SECONDS, Repository, assess_strategy_walk_forward, summarize_ai_decision_outcomes
 from ths_stock_picker.ths_monitor import inspect_ths_source
+from ths_stock_picker.tdx_blocks import BLOCK_HEADER_SIZE, BLOCK_RECORD_SIZE, ThemeMembership
 from ths_stock_picker.models import NewsItem, QuoteRealtime, Security, WatchlistEntry
 from ths_stock_picker.web_panel import (
     DashboardFilters,
@@ -40,21 +43,111 @@ from ths_stock_picker.web_panel import (
     render_notes_page,
     render_news_page,
     render_symbol_detail,
+    render_themes_page,
     render_ths_monitor_page,
 )
 from tests.test_ths_local import make_fake_ths
 
 
 class StorageCliTests(unittest.TestCase):
-    def test_repository_sets_sqlite_busy_timeout(self) -> None:
+    def test_repository_configures_a_busy_timeout_for_concurrent_web_and_cli_access(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo = Repository(Path(temp_dir) / "picker.db")
             try:
-                timeout_ms = repo.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                self.assertEqual(
+                    repo.conn.execute("PRAGMA busy_timeout").fetchone()[0],
+                    SQLITE_BUSY_TIMEOUT_SECONDS * 1000,
+                )
             finally:
                 repo.close()
 
-            self.assertGreaterEqual(timeout_ms, 30_000)
+    def test_theme_memberships_replace_source_and_render_latest_score_heat(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            concept_source = Path(temp_dir) / "block_gn.dat"
+            style_source = Path(temp_dir) / "block_fg.dat"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                imported = repo.replace_stock_themes(
+                    [
+                        ThemeMembership("000001", "概念", "人工智能", concept_source),
+                        ThemeMembership("600000", "概念", "人工智能", concept_source),
+                        ThemeMembership("000001", "风格", "专精特新", style_source),
+                    ],
+                    [concept_source, style_source],
+                )
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol=symbol,
+                            trade_date=(date(2026, 1, 1) + timedelta(days=index)).isoformat(),
+                            open=base + increment * index,
+                            high=base + increment * index,
+                            low=base + increment * index,
+                            close=base + increment * index,
+                            volume=1_000_000,
+                            amount=None,
+                            source_file=Path(f"tdx://lday/{symbol}.day"),
+                        )
+                        for symbol, base, increment in (("000001", 100.0, 1.0), ("600000", 200.0, 2.0))
+                        for index in range(21)
+                    ]
+                )
+                repo.insert_quotes(
+                    [
+                        QuoteRealtime("000001", "平安银行", "sz", 12.0, 1.2, 2_000_000, 150_000_000),
+                        QuoteRealtime("600000", "浦发银行", "sh", 10.0, -1.0, 1_000_000, 80_000_000),
+                    ]
+                )
+                repo.score_latest_quotes()
+                heat = repo.theme_heat(limit=10, min_scored=1)
+                symbol_themes = repo.themes_for_symbol("000001")
+                html = render_themes_page(repo, min_scored=1)
+                detail_html = render_symbol_detail(repo, "000001")
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date="2026-01-21",
+                            open=130.0,
+                            high=130.0,
+                            low=130.0,
+                            close=130.0,
+                            volume=1_000_000,
+                            amount=None,
+                            source_file=Path("tdx://lday/000001.day"),
+                        )
+                    ]
+                )
+                updated_heat = repo.theme_heat(limit=10, min_scored=1)
+                replaced = repo.replace_stock_themes(
+                    [ThemeMembership("000001", "概念", "人工智能", concept_source)],
+                    [concept_source],
+                )
+                counts = repo.table_counts()
+            finally:
+                repo.close()
+
+        self.assertEqual(imported, 3)
+        self.assertEqual(replaced, 1)
+        self.assertEqual(counts["stock_themes"], 2)
+        self.assertEqual(counts["theme_price_cache"], 1)
+        self.assertEqual({(row["category"], row["theme"]) for row in symbol_themes}, {("概念", "人工智能"), ("风格", "专精特新")})
+        ai_theme = next(row for row in heat["items"] if row["theme"] == "人工智能")
+        self.assertEqual(ai_theme["scored_count"], 2)
+        self.assertIsNotNone(ai_theme["average_score"])
+        self.assertEqual(heat["price_as_of_date"], "2026-01-21")
+        self.assertEqual(ai_theme["priced_count"], 2)
+        self.assertAlmostEqual(float(ai_theme["price_coverage_rate"]), 100.0)
+        self.assertAlmostEqual(float(ai_theme["return_20d"]), 20.0)
+        self.assertEqual(ai_theme["return_20d_count"], 2)
+        updated_ai_theme = next(row for row in updated_heat["items"] if row["theme"] == "人工智能")
+        self.assertAlmostEqual(float(updated_ai_theme["return_20d"]), 25.0)
+        self.assertIn("主题评分与价格表现", html)
+        self.assertIn("20 日等权", html)
+        self.assertIn("人工智能", html)
+        self.assertIn("概念与风格", detail_html)
 
     def test_daily_bars_prefer_tdx_source_and_report_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -200,6 +293,56 @@ class StorageCliTests(unittest.TestCase):
         self.assertEqual(freshness["weekday_lag_days"], 2)
         self.assertEqual(freshness["freshness_status"], "lagging")
 
+    def test_daily_bar_health_cache_is_reused_and_invalidated_by_new_bars(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date="2026-06-05",
+                            open=10.0,
+                            high=10.2,
+                            low=9.8,
+                            close=10.0,
+                            volume=1_000_000,
+                            amount=None,
+                            source_file=Path("tdx://lday/sz/sz000001.day"),
+                        )
+                    ]
+                )
+                first = repo.daily_bar_health(as_of=date(2026, 6, 9))
+                cached = repo.daily_bar_health(as_of=date(2026, 6, 9))
+                cache_rows_before = repo.conn.execute("SELECT COUNT(*) FROM daily_bar_health_cache").fetchone()[0]
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date="2026-06-09",
+                            open=10.0,
+                            high=10.2,
+                            low=9.8,
+                            close=10.0,
+                            volume=1_000_000,
+                            amount=None,
+                            source_file=Path("tdx://lday/sz/sz000001.day"),
+                        )
+                    ]
+                )
+                refreshed = repo.daily_bar_health(as_of=date(2026, 6, 9))
+                cache_rows_after = repo.conn.execute("SELECT COUNT(*) FROM daily_bar_health_cache").fetchone()[0]
+            finally:
+                repo.close()
+
+        self.assertEqual(first["latest_trade_date"], "2026-06-05")
+        self.assertEqual(cached, first)
+        self.assertEqual(cache_rows_before, 1)
+        self.assertEqual(refreshed["latest_trade_date"], "2026-06-09")
+        self.assertEqual(cache_rows_after, 1)
+
     def test_quote_health_reports_empty_current_and_lagging_prices(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db = Path(temp_dir) / "picker.db"
@@ -265,6 +408,67 @@ class StorageCliTests(unittest.TestCase):
         self.assertEqual(partial["current_priced_symbols"], 1)
         self.assertEqual(partial["stale_priced_symbols"], 1)
         self.assertIn("行情时效提醒", ai_html)
+
+    def test_fundamental_health_counts_only_reports_disclosed_before_the_as_of_date(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_fundamentals(
+                    [
+                        FundamentalRecord(
+                            symbol="600000",
+                            report_date="2026-03-31",
+                            notice_date="2026-04-25",
+                            revenue=100.0,
+                            net_profit=10.0,
+                            roe=8.5,
+                            operating_cash_flow=None,
+                            pe_ttm=None,
+                            pb=None,
+                            source_file=Path("public"),
+                        ),
+                        FundamentalRecord(
+                            symbol="000001",
+                            report_date="2026-06-30",
+                            notice_date="2026-07-15",
+                            revenue=100.0,
+                            net_profit=10.0,
+                            roe=8.5,
+                            operating_cash_flow=None,
+                            pe_ttm=None,
+                            pb=None,
+                            source_file=Path("public"),
+                        ),
+                        FundamentalRecord(
+                            symbol="000001",
+                            report_date="2025-12-31",
+                            notice_date=None,
+                            revenue=100.0,
+                            net_profit=10.0,
+                            roe=8.5,
+                            operating_cash_flow=20.0,
+                            pe_ttm=8.0,
+                            pb=1.0,
+                            source_file=Path("manual"),
+                        ),
+                    ]
+                )
+                health = repo.fundamental_health(as_of=date(2026, 7, 14))
+                html = render_data_health_page(repo)
+            finally:
+                repo.close()
+
+        self.assertEqual(health["total_records"], 3)
+        self.assertEqual(health["total_symbols"], 2)
+        self.assertEqual(health["disclosed_records"], 1)
+        self.assertEqual(health["disclosed_symbols"], 1)
+        self.assertEqual(health["latest_imported_report_date"], "2026-06-30")
+        self.assertEqual(health["latest_disclosed_report_date"], "2026-03-31")
+        self.assertEqual(health["latest_disclosed_notice_date"], "2026-04-25")
+        self.assertIn("财务披露覆盖", html)
+        self.assertIn("已披露股票", html)
 
     def test_lagging_daily_bars_render_warning_on_research_pages(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -351,6 +555,7 @@ class StorageCliTests(unittest.TestCase):
                     max_bars=45,
                     execution_mode="next_open",
                 )
+                benchmark_indices = repo.available_benchmark_indices()
             finally:
                 repo.close()
 
@@ -380,6 +585,7 @@ class StorageCliTests(unittest.TestCase):
             benchmark = result["benchmark"]
             self.assertIsNotNone(benchmark)
             self.assertEqual(benchmark["daily_returns"][0]["trade_date"], first_trade["trade_date"])
+            self.assertEqual(benchmark_indices, [{"symbol": "sh000300", "name": "沪深300", "latest_trade_date": "2026-02-14"}])
 
     def test_strategy_backtest_skips_locked_limit_entry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -726,6 +932,12 @@ class StorageCliTests(unittest.TestCase):
             (lday / "sh600000.day").write_bytes(
                 struct.pack("IIIIIfII", 20260709, 1000, 1020, 990, 1010, 1_000_000.0, 100_000, 0)
             )
+            block_path = tdx_root / "T0002" / "hq_cache" / "block_gn.dat"
+            block_path.parent.mkdir(parents=True)
+            block_payload = b"\0\0" + "人工智能".encode("gbk") + b"\0"
+            block_payload += (1).to_bytes(2, "little") + b"\x02\0" + b"600000\0"
+            block_header = b"Registry ver:1.0 (1999-9-28)".ljust(BLOCK_HEADER_SIZE, b"\0")
+            block_path.write_bytes(block_header + block_payload.ljust(BLOCK_RECORD_SIZE, b"\0"))
             output = io.StringIO()
             with (
                 patch("ths_stock_picker.cli._import_public_quotes", return_value=0),
@@ -743,6 +955,7 @@ class StorageCliTests(unittest.TestCase):
                             "run-daily",
                             "--tdx-root",
                             str(tdx_root),
+                            "--tdx-import-themes",
                         ]
                     ),
                     0,
@@ -753,6 +966,7 @@ class StorageCliTests(unittest.TestCase):
             try:
                 repo.init_schema()
                 bars = repo.daily_bars_for_symbol("600000")
+                themes = repo.themes_for_symbol("600000")
                 run = repo.daily_runs(limit=1)[0]
                 health = repo.daily_bar_health()
                 daily_runs_html = render_daily_runs_page(repo)
@@ -766,6 +980,8 @@ class StorageCliTests(unittest.TestCase):
         self.assertEqual(health["sources"][0]["source_kind"], "tdx_unadjusted")
         self.assertEqual(summary["tdx_daily_bars_imported"], 1)
         self.assertEqual(summary["tdx_daily_files"], 1)
+        self.assertEqual(summary["tdx_theme_memberships_imported"], 1)
+        self.assertEqual(len(themes), 1)
         self.assertEqual(summary["daily_bar_health"]["latest_trade_date"], "2026-07-09")
         self.assertIn(summary["daily_bar_health"]["freshness_status"], {"current", "lagging", "unknown"})
         self.assertEqual(summary["quote_health"]["freshness_status"], "empty")
@@ -774,13 +990,153 @@ class StorageCliTests(unittest.TestCase):
         self.assertEqual(summary["daily_audit_export_tables"], exported_tables)
         self.assertNotIn("daily_bars", exported_tables)
         self.assertIn("scores", exported_tables)
+        self.assertIn("stock_themes", exported_tables)
         self.assertEqual(parameters["tdx_root"], str(tdx_root))
-        self.assertIn("Step 1/8: importing TongDaXin local daily bars", output.getvalue())
+        self.assertIn("Step 1/9: importing TongDaXin local daily bars", output.getvalue())
+        self.assertIn("Step 2/9: importing TongDaXin local themes", output.getvalue())
         self.assertIn("TDX 同步", daily_runs_html)
         self.assertIn("日线时效", daily_runs_html)
         self.assertIn("行情时效", daily_runs_html)
         self.assertIn("AI 快照", daily_runs_html)
         self.assertIn("2026-07-09", daily_runs_html)
+
+    def test_run_daily_optionally_imports_public_fundamentals_and_records_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / "picker.db"
+            ths_root = make_fake_ths(root)
+            record = FundamentalRecord(
+                symbol="600000",
+                report_date="2026-03-31",
+                notice_date="2026-04-25",
+                revenue=100.0,
+                net_profit=10.0,
+                roe=8.5,
+                operating_cash_flow=None,
+                pe_ttm=None,
+                pb=None,
+                source_file=Path("public"),
+                revenue_yoy=5.0,
+                net_profit_yoy=3.0,
+            )
+            output = io.StringIO()
+            with (
+                patch("ths_stock_picker.cli._import_public_quotes", return_value=0),
+                patch("ths_stock_picker.cli._select_universe_symbols", return_value=("test", ["600000"])),
+                patch("ths_stock_picker.cli.fetch_tencent_daily_bars", return_value=[]),
+                patch("ths_stock_picker.cli.fetch_eastmoney_fundamentals_one", return_value=[record]) as fundamentals_mock,
+                patch("ths_stock_picker.cli._export", return_value=0),
+                redirect_stdout(output),
+            ):
+                self.assertEqual(
+                    main(
+                        [
+                            "--db",
+                            str(db),
+                            "--ths-root",
+                            str(ths_root),
+                            "run-daily",
+                            "--limit",
+                            "1",
+                            "--public-fundamentals",
+                            "--public-fundamental-reports",
+                            "3",
+                            "--public-fundamental-limit",
+                            "1",
+                            "--out-dir",
+                            str(root / "outputs"),
+                        ]
+                    ),
+                    0,
+                )
+
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                summary = json.loads(repo.daily_runs(limit=1)[0]["summary_json"])
+                parameters = json.loads(repo.daily_runs(limit=1)[0]["parameters_json"])
+                fundamental = repo.latest_fundamental("600000")
+                html = render_daily_runs_page(repo)
+            finally:
+                repo.close()
+
+        self.assertEqual(summary["public_fundamentals_imported"], 1)
+        self.assertEqual(summary["public_fundamentals_failures"], 0)
+        self.assertTrue(summary["public_fundamentals_enabled"])
+        self.assertEqual(summary["fundamental_health"]["disclosed_symbols"], 1)
+        self.assertTrue(parameters["public_fundamentals"])
+        self.assertEqual(parameters["public_fundamental_reports"], 3)
+        self.assertEqual(parameters["public_fundamental_limit"], 1)
+        self.assertEqual(summary["public_fundamental_symbols_requested"], 1)
+        self.assertEqual(fundamental["revenue_yoy"], 5.0)
+        fundamentals_mock.assert_called_once_with("600000", reports=3)
+        self.assertIn("Step 5/8: fetching public financial reports", output.getvalue())
+        self.assertIn("Using 1 of 1 selected symbols for public financial reports", output.getvalue())
+        self.assertIn("公开财报", html)
+        self.assertIn("1 条", html)
+        self.assertIn("1 只已披露", html)
+
+    def test_run_daily_optionally_imports_public_industries_and_records_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db = root / "picker.db"
+            ths_root = make_fake_ths(root)
+            output = io.StringIO()
+            with (
+                patch("ths_stock_picker.cli._import_public_quotes", return_value=0),
+                patch("ths_stock_picker.cli._select_universe_symbols", return_value=("test", ["600000"])),
+                patch("ths_stock_picker.cli.fetch_tencent_daily_bars", return_value=[]),
+                patch(
+                    "ths_stock_picker.cli.fetch_eastmoney_industry_one",
+                    return_value=IndustryClassification("600000", "金融-银行-股份制与城商行"),
+                ) as industries_mock,
+                patch("ths_stock_picker.cli._export", return_value=0) as export_mock,
+                redirect_stdout(output),
+            ):
+                self.assertEqual(
+                    main(
+                        [
+                            "--db",
+                            str(db),
+                            "--ths-root",
+                            str(ths_root),
+                            "run-daily",
+                            "--limit",
+                            "1",
+                            "--public-industries",
+                            "--public-industry-limit",
+                            "1",
+                            "--out-dir",
+                            str(root / "outputs"),
+                        ]
+                    ),
+                    0,
+                )
+
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                run = repo.daily_runs(limit=1)[0]
+                summary = json.loads(run["summary_json"])
+                parameters = json.loads(run["parameters_json"])
+                industry = repo.industry_for_symbol("600000")
+                html = render_daily_runs_page(repo)
+            finally:
+                repo.close()
+
+        self.assertTrue(summary["public_industries_enabled"])
+        self.assertEqual(summary["public_industry_symbols_requested"], 1)
+        self.assertEqual(summary["public_industries_imported"], 1)
+        self.assertEqual(summary["public_industries_failures"], 0)
+        self.assertTrue(parameters["public_industries"])
+        self.assertEqual(parameters["public_industry_limit"], 1)
+        self.assertEqual(industry["industry"], "金融-银行-股份制与城商行")
+        self.assertIn("stock_industries", export_mock.call_args.args[2])
+        industries_mock.assert_called_once_with("600000")
+        self.assertIn("Step 5/8: fetching public industry labels", output.getvalue())
+        self.assertIn("Using 1 of 1 selected symbols for public industry labels", output.getvalue())
+        self.assertIn("公开行业", html)
+        self.assertIn("1 条", html)
 
     def test_run_daily_saves_ai_snapshot_and_tolerates_ai_errors(self) -> None:
         decision = AIDecision(
@@ -1301,6 +1657,73 @@ class StorageCliTests(unittest.TestCase):
 
             self.assertTrue(fresh)
             self.assertNotEqual(fresh[0]["factor_id"], "stale")
+
+    def test_disclosed_fundamental_factor_uses_notice_date_and_invalidates_factor_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "picker.db"
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                repo.upsert_daily_bars(
+                    [
+                        DailyBar(
+                            symbol="000001",
+                            trade_date=f"2026-06-{day:02d}",
+                            open=10 + day * 0.04,
+                            high=10 + day * 0.04 + 0.1,
+                            low=10 + day * 0.04 - 0.1,
+                            close=10 + day * 0.04,
+                            volume=10_000_000 + day,
+                            amount=None,
+                            source_file=Path("test"),
+                        )
+                        for day in range(1, 46)
+                    ]
+                )
+                record = FundamentalRecord(
+                    symbol="000001",
+                    report_date="2026-03-31",
+                    notice_date="2026-06-20",
+                    revenue=100.0,
+                    net_profit=10.0,
+                    roe=12.0,
+                    operating_cash_flow=None,
+                    pe_ttm=None,
+                    pb=None,
+                    source_file=Path("public"),
+                    revenue_yoy=4.0,
+                    net_profit_yoy=3.0,
+                )
+                repo.upsert_fundamentals([record])
+
+                self.assertIsNone(repo.disclosed_fundamental_as_of("000001", "2026-06-20"))
+                self.assertEqual(repo.disclosed_fundamental_as_of("000001", "2026-06-21")["report_date"], "2026-03-31")
+                initial = repo.factor_scan(limit=20, symbols=["000001"], use_cache=True)
+                backtest = repo.factor_backtest(horizon_days=3)
+                strategy = repo.strategy_backtest(horizon_days=3, min_signal_score=1)
+                self.assertTrue(any(row["factor_id"] == "disclosed_profitability_quality" for row in initial))
+                financial_row = next(row for row in backtest if row["factor_id"] == "disclosed_profitability_quality")
+                self.assertEqual(financial_row["samples"], 22)
+                growth_row = next(row for row in backtest if row["factor_id"] == "disclosed_growth_quality")
+                self.assertEqual(growth_row["samples"], 22)
+                self.assertGreater(strategy["trade_count"], 0)
+                self.assertTrue(any("已披露盈利质量" in str(row["factors"]) for row in strategy["trades"]))
+
+                cache_key = repo._factor_scan_cache_key(20, ["000001"])
+                with repo.conn:
+                    repo.conn.execute(
+                        "UPDATE factor_scan_cache SET rows_json = ? WHERE cache_key = ?",
+                        (json.dumps([{"symbol": "stale", "factor_id": "stale"}]), cache_key),
+                    )
+                self.assertEqual(repo.factor_scan(limit=20, symbols=["000001"], use_cache=True)[0]["factor_id"], "stale")
+
+                repo.upsert_fundamentals([record])
+                refreshed = repo.factor_scan(limit=20, symbols=["000001"], use_cache=True)
+            finally:
+                repo.close()
+
+        self.assertTrue(any(row["factor_id"] == "disclosed_profitability_quality" for row in refreshed))
+        self.assertNotEqual(refreshed[0]["factor_id"], "stale")
 
     def test_factor_scan_auto_cache_skips_universe_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2433,6 +2856,12 @@ class StorageCliTests(unittest.TestCase):
             repo = Repository(db)
             try:
                 repo.init_schema()
+                repo.upsert_stock_industries(
+                    [
+                        IndustryClassification("000001", "金融-银行-股份制与城商行"),
+                        IndustryClassification("000016", "金融-银行-股份制与城商行"),
+                    ]
+                )
                 repo.upsert_public_quotes(
                     [
                         QuoteObservation(
@@ -2497,6 +2926,8 @@ class StorageCliTests(unittest.TestCase):
             self.assertIn("# A 股选股日报", report_text)
             self.assertIn("消息面", report_text)
             self.assertIn("1条：平安银行:关于投资者关系活动记录表", report_text)
+            self.assertIn("## 当前行业热度", report_text)
+            self.assertIn("金融-银行-股份制与城商行", report_text)
 
     def test_web_dashboard_renders_candidates_and_counts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

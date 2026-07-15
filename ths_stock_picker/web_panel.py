@@ -359,6 +359,7 @@ def render_backtest_page(
         execution_mode=selected_execution_mode,
         position_mode=selected_position_mode,
     )
+    benchmark_indices = repo.available_benchmark_indices()
     return _page(
         "策略回测",
         [
@@ -375,6 +376,7 @@ def render_backtest_page(
                 cost_bps,
                 slippage_bps,
                 benchmark_symbol,
+                benchmark_indices,
                 max_bars,
             ),
             _render_backtest_summary(result),
@@ -455,12 +457,50 @@ def render_ths_monitor_page(ths_root: Path = DEFAULT_THS_ROOT) -> str:
 
 def render_data_health_page(repo: Repository) -> str:
     health = repo.daily_bar_health()
+    fundamental_health = repo.fundamental_health()
+    industry_health = repo.industry_health()
     return _page(
         "日线数据健康",
         [
-            _topbar("日线数据健康", "检查历史日线来源、覆盖范围和同日来源冲突", back_link="/"),
+            _topbar("数据健康", "检查日线来源、财务披露与当前行业归属覆盖", back_link="/"),
             _render_data_health_summary(health),
             _render_data_health_sources(health),
+            _render_fundamental_health(fundamental_health),
+            _render_industry_health(industry_health),
+        ],
+    )
+
+
+def render_themes_page(repo: Repository, limit: int = 50, category: str = "", min_scored: int = 3) -> str:
+    selected_category = category if category in {"概念", "风格"} else ""
+    selected_min_scored = max(1, min_scored)
+    summary = repo.theme_heat(limit=limit, category=selected_category, min_scored=selected_min_scored)
+    count = repo.table_counts().get("stock_themes", 0)
+    score_date = summary.get("score_date") or "暂无评分批次"
+    price_as_of_date = summary.get("price_as_of_date") or "暂无足够日线"
+    return _page(
+        "主题热度",
+        [
+            _topbar("主题热度", "基于本地主题成员、评分与等权价格表现汇总，不等同于官方板块指数", back_link="/"),
+            _render_theme_controls(limit, selected_category, selected_min_scored),
+            _render_theme_summary(count, str(score_date), str(price_as_of_date), selected_min_scored),
+            _render_theme_heat(summary.get("items", [])),
+        ],
+    )
+
+
+def render_industries_page(repo: Repository, limit: int = 50, min_scored: int = 3) -> str:
+    selected_min_scored = max(1, min_scored)
+    summary = repo.industry_heat(limit=limit, min_scored=selected_min_scored)
+    count = repo.table_counts().get("stock_industries", 0)
+    score_date = summary.get("score_date") or "暂无评分批次"
+    return _page(
+        "行业概览",
+        [
+            _topbar("行业概览", "公开行业标签与当前本地评分汇总，仅作研究上下文", back_link="/"),
+            _render_industry_controls(limit, selected_min_scored),
+            _render_industry_summary(count, str(score_date), selected_min_scored),
+            _render_industry_heat(summary.get("items", [])),
         ],
     )
 
@@ -627,8 +667,11 @@ def _symbol_detail_sections(repo: Repository, symbol: str, bars_limit: int) -> t
     bars = repo.recent_daily_bars(symbol, limit=bars_limit)
     chart_bars = repo.recent_daily_bars(symbol, limit=60)
     note = repo.stock_note(symbol)
+    fundamental = repo.latest_fundamental(symbol)
+    industry = repo.industry_for_symbol(symbol)
     ai_decision = analyze_symbol(repo, symbol)
     related_news = repo.related_news_for_symbol(symbol, name=row["name"], limit=8)
+    themes = repo.themes_for_symbol(symbol)
     if not related_news and ai_decision is not None:
         related_news = ai_decision.evidence.get("news", [])
     title = f"{row['symbol']} {row['name'] or ''}".strip()
@@ -640,7 +683,10 @@ def _symbol_detail_sections(repo: Repository, symbol: str, bars_limit: int) -> t
             _render_diagnosis_data_status(row, chart_bars, related_news, note, ai_decision),
             _render_ai_symbol_decision(ai_decision),
             _render_stock_note(symbol, note),
+            _render_fundamental(fundamental),
+            _render_industry_context(industry),
             _render_related_news(related_news),
+            _render_symbol_themes(themes),
             _render_price_chart(chart_bars),
             _render_components(components),
             _render_rules(rules),
@@ -722,6 +768,31 @@ def serve_dashboard(
                 try:
                     repo.init_schema()
                     page = render_diagnose_page(repo, symbol=symbol)
+                finally:
+                    repo.close()
+                self._write_text(page, "text/html; charset=utf-8")
+                return
+            if parsed.path == "/themes":
+                query = parse_qs(parsed.query)
+                page_limit = int(_to_float(_first(query, "limit"), 50.0))
+                category = _first(query, "category") or ""
+                min_scored = int(_to_float(_first(query, "min_scored"), 3.0))
+                repo = Repository(db_path)
+                try:
+                    repo.init_schema()
+                    page = render_themes_page(repo, limit=page_limit, category=category, min_scored=min_scored)
+                finally:
+                    repo.close()
+                self._write_text(page, "text/html; charset=utf-8")
+                return
+            if parsed.path == "/industries":
+                query = parse_qs(parsed.query)
+                page_limit = int(_to_float(_first(query, "limit"), 50.0))
+                min_scored = int(_to_float(_first(query, "min_scored"), 3.0))
+                repo = Repository(db_path)
+                try:
+                    repo.init_schema()
+                    page = render_industries_page(repo, limit=page_limit, min_scored=min_scored)
                 finally:
                     repo.close()
                 self._write_text(page, "text/html; charset=utf-8")
@@ -1075,6 +1146,8 @@ def _render_counts(counts: dict[str, int]) -> str:
         "scores": "评分",
         "score_runs": "批次",
         "daily_bars": "日线",
+        "fundamentals": "财务",
+        "stock_themes": "主题",
     }
     cards = []
     for key, label in labels.items():
@@ -1280,6 +1353,8 @@ def _render_app_nav(active: str) -> str:
         ("/backtest", "策略回测"),
         ("/strategy-validation", "样本外验证"),
         ("/factors", "因子验证"),
+        ("/themes", "主题热度"),
+        ("/industries", "行业概览"),
         ("/news", "资讯"),
         ("/notes", "观察池"),
         ("/ths", "数据源"),
@@ -1320,6 +1395,10 @@ def _active_path_for_title(title: str) -> str:
         return "/backtest"
     if "因子" in title:
         return "/factors"
+    if "主题热度" in title:
+        return "/themes"
+    if "行业概览" in title:
+        return "/industries"
     if "资讯" in title:
         return "/news"
     if "观察" in title:
@@ -1523,6 +1602,21 @@ def _render_related_news(rows: list[object]) -> str:
     return _table_section("相关新闻", ["时间", "标题", "标签", "摘要"], body)
 
 
+def _render_symbol_themes(rows: list[object]) -> str:
+    body = []
+    for row in rows:
+        body.append(
+            "<tr>"
+            f"<td>{_e(row['category'])}</td>"
+            f"<td>{_e(row['theme'])}</td>"
+            f"<td>{_e(row['updated_at'])}</td>"
+            "</tr>"
+        )
+    if not body:
+        body.append('<tr><td colspan="3" class="empty">暂无本地主题归属，请先导入通达信板块缓存。</td></tr>')
+    return _table_section("概念与风格", ["类别", "主题", "更新时间"], body)
+
+
 def _render_ths_summary(snapshot: THSMonitorSnapshot) -> str:
     status_class = {
         "active": "ok",
@@ -1594,6 +1688,50 @@ def _render_data_health_sources(health: dict[str, object]) -> str:
     policy = _e(str(health.get("canonical_source_policy") or "-"))
     note = f'<section class="panel"><h2>规范来源</h2><p>{policy}</p></section>'
     return note + _table_section("日线来源覆盖", ["来源", "日线", "标的", "最早交易日", "最近交易日"], body)
+
+
+def _render_fundamental_health(health: dict[str, object]) -> str:
+    cards = [
+        ("已导入记录", f"{int(health.get('total_records') or 0):,}"),
+        ("覆盖股票", f"{int(health.get('total_symbols') or 0):,}"),
+        ("已披露股票", f"{int(health.get('disclosed_symbols') or 0):,}"),
+        ("已披露记录", f"{int(health.get('disclosed_records') or 0):,}"),
+        ("现金流覆盖股票", f"{int(health.get('operating_cash_flow_symbols') or 0):,}"),
+        ("现金流记录", f"{int(health.get('operating_cash_flow_records') or 0):,}"),
+        ("已披露最新报告期", health.get("latest_disclosed_report_date") or "-"),
+        ("已披露最新公告日", health.get("latest_disclosed_notice_date") or "-"),
+    ]
+    note = (
+        '<section class="panel"><h2>财务披露覆盖</h2>'
+        f"<p>按 {_e(health.get('as_of_date') or '-')} 的日期边界统计；同日公告从下一交易日才会进入财务因子。"
+        f"已导入来源 {int(health.get('source_count') or 0):,} 个，最近已导入报告期 {_e(health.get('latest_imported_report_date') or '-')}。"
+        "</p></section>"
+    )
+    metrics = "".join(
+        '<article class="metric"><span>' + _e(label) + "</span><strong>" + _e(value) + "</strong></article>"
+        for label, value in cards
+    )
+    return note + '<section class="metrics">' + metrics + "</section>"
+
+
+def _render_industry_health(health: dict[str, object]) -> str:
+    cards = [
+        ("行业归属记录", f"{int(health.get('label_records') or 0):,}"),
+        ("行业数量", f"{int(health.get('industry_count') or 0):,}"),
+        ("当前评分已覆盖", f"{int(health.get('scored_symbols') or 0):,}"),
+        ("对应评分日期", health.get("score_date") or "-"),
+        ("最新更新时间", health.get("latest_updated_at") or "-"),
+    ]
+    note = (
+        '<section class="panel"><h2>行业归属覆盖</h2>'
+        "<p>行业标签来自公开公司概况，仅用于当前研究展示；不会进入历史因子、策略回测或样本外验证。</p>"
+        "</section>"
+    )
+    metrics = "".join(
+        '<article class="metric"><span>' + _e(label) + "</span><strong>" + _e(value) + "</strong></article>"
+        for label, value in cards
+    )
+    return note + '<section class="metrics">' + metrics + "</section>"
 
 
 def _render_strategy_validation_runs(rows: list[object]) -> str:
@@ -1703,6 +1841,8 @@ def _render_daily_runs(rows: list[object]) -> str:
         status = str(row["status"])
         freshness_text = _daily_run_freshness_label(summary)
         quote_freshness_text = _daily_run_quote_freshness_label(summary)
+        fundamentals_text = _daily_run_fundamentals_label(summary)
+        industries_text = _daily_run_industries_label(summary)
         ai_snapshot_text = _daily_run_ai_snapshot_label(summary)
         announcements_text = _daily_run_public_announcements_label(summary, parameters)
         parameter_text = (
@@ -1721,6 +1861,8 @@ def _render_daily_runs(rows: list[object]) -> str:
             f"<td class=\"num\">{int(summary.get('history_bars_imported') or 0):,}</td>"
             f"<td>{_e(freshness_text)}</td>"
             f"<td>{_e(quote_freshness_text)}</td>"
+            f"<td>{_e(fundamentals_text)}</td>"
+            f"<td>{_e(industries_text)}</td>"
             f"<td>{_e(ai_snapshot_text)}</td>"
             f"<td>{_e(announcements_text)}</td>"
             f"<td>{_e(summary.get('failed_step') or '-')}</td>"
@@ -1729,10 +1871,10 @@ def _render_daily_runs(rows: list[object]) -> str:
             "</tr>"
         )
     if not body:
-        body.append('<tr><td colspan="14" class="empty">暂无每日运行记录。请先运行 run-daily。</td></tr>')
+        body.append('<tr><td colspan="16" class="empty">暂无每日运行记录。请先运行 run-daily。</td></tr>')
     return _table_section(
         "最近每日运行",
-        ["开始时间", "结束时间", "状态", "标的", "TDX 已覆盖", "TDX 同步", "公开日线", "日线时效", "行情时效", "AI 快照", "公告", "失败步骤", "参数", "错误"],
+        ["开始时间", "结束时间", "状态", "标的", "TDX 已覆盖", "TDX 同步", "公开日线", "日线时效", "行情时效", "公开财报", "公开行业", "AI 快照", "公告", "失败步骤", "参数", "错误"],
         body,
     )
 
@@ -1788,6 +1930,30 @@ def _daily_run_public_announcements_label(summary: dict[str, object], parameters
     if imported is not None:
         return f"已保存 {int(imported or 0)} 条"
     return "-"
+
+
+def _daily_run_fundamentals_label(summary: dict[str, object]) -> str:
+    health = summary.get("fundamental_health")
+    disclosed_symbols = int(health.get("disclosed_symbols") or 0) if isinstance(health, dict) else 0
+    if not summary.get("public_fundamentals_enabled"):
+        return f"未更新 · {disclosed_symbols} 只已披露" if isinstance(health, dict) else "未启用"
+    imported = int(summary.get("public_fundamentals_imported") or 0)
+    failures = int(summary.get("public_fundamentals_failures") or 0)
+    coverage = f"{imported} 条，{disclosed_symbols} 只已披露"
+    if failures:
+        return f"{coverage}，失败 {failures} 只"
+    return coverage
+
+
+def _daily_run_industries_label(summary: dict[str, object]) -> str:
+    if not summary.get("public_industries_enabled"):
+        return "未更新"
+    imported = int(summary.get("public_industries_imported") or 0)
+    failures = int(summary.get("public_industries_failures") or 0)
+    coverage = f"{imported} 条"
+    if failures:
+        return f"{coverage}，失败 {failures} 只"
+    return coverage
 
 
 def _daily_run_ai_snapshot_label(summary: dict[str, object]) -> str:
@@ -1866,6 +2032,138 @@ def _render_factor_controls(limit: int, horizon: int) -> str:
         "</form>"
         "</section>"
     )
+
+
+def _render_theme_controls(limit: int, category: str, min_scored: int) -> str:
+    options = [("", "全部"), ("概念", "概念"), ("风格", "风格")]
+    category_options = "".join(
+        f'<option value="{_e(value)}"{" selected" if value == category else ""}>{_e(label)}</option>'
+        for value, label in options
+    )
+    return (
+        '<section class="panel filter-panel">'
+        '<form class="filters ai-filters" method="get" action="/themes">'
+        '<label><span>类别</span>'
+        f'<select name="category">{category_options}</select>'
+        "</label>"
+        '<label><span>主题数量</span>'
+        f'<input name="limit" type="number" min="1" max="300" value="{limit}">'
+        "</label>"
+        '<label><span>最低评分覆盖</span>'
+        f'<input name="min_scored" type="number" min="1" max="100" value="{min_scored}">'
+        "</label>"
+        '<button type="submit">刷新</button>'
+        '<a class="ghost" href="/themes">重置</a>'
+        "</form>"
+        "</section>"
+    )
+
+
+def _render_industry_controls(limit: int, min_scored: int) -> str:
+    return (
+        '<section class="panel filter-panel">'
+        '<form class="filters ai-filters" method="get" action="/industries">'
+        '<label><span>行业数量</span>'
+        f'<input name="limit" type="number" min="1" max="300" value="{limit}">'
+        "</label>"
+        '<label><span>最低评分覆盖</span>'
+        f'<input name="min_scored" type="number" min="1" max="100" value="{min_scored}">'
+        "</label>"
+        '<button type="submit">刷新</button>'
+        '<a class="ghost" href="/industries">重置</a>'
+        "</form>"
+        "</section>"
+    )
+
+
+def _render_industry_summary(industry_count: int, score_date: str, min_scored: int) -> str:
+    return (
+        '<section class="panel">'
+        "<h2>数据口径</h2>"
+        f"<p>当前已导入 {industry_count:,} 条公开行业归属；评分口径：{_e(score_date)}。</p>"
+        f"<p>仅展示当前评分批次覆盖至少 {min_scored} 只股票的行业。行业标签会随公开数据源变化，只用于当前研究上下文，不参与历史回测。</p>"
+        "</section>"
+    )
+
+
+def _render_industry_heat(rows: object) -> str:
+    body = []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            coverage_rate = row.get("coverage_rate")
+            positive_rate = row.get("positive_rate")
+            coverage_text = f"{float(coverage_rate):.1f}%" if coverage_rate is not None else "-"
+            positive_text = f"{float(positive_rate):.1f}%" if positive_rate is not None else "-"
+            body.append(
+                "<tr>"
+                f"<td>{_e(row.get('industry'))}</td>"
+                f"<td class=\"num\">{int(row.get('member_count') or 0):,}</td>"
+                f"<td class=\"num\">{int(row.get('scored_count') or 0):,}</td>"
+                f"<td class=\"num\">{_e(coverage_text)}</td>"
+                f"<td class=\"num strong\">{_fmt(row.get('average_score'))}</td>"
+                f"<td class=\"num\">{_e(positive_text)}</td>"
+                "</tr>"
+            )
+    if not body:
+        body.append('<tr><td colspan="6" class="empty">暂无符合覆盖条件的行业，请先导入公开行业标签并运行评分。</td></tr>')
+    return _table_section("行业评分汇总", ["行业", "成员", "评分覆盖", "覆盖率", "平均分", "正分占比"], body)
+
+
+def _render_theme_summary(membership_count: int, score_date: str, price_as_of_date: str, min_scored: int) -> str:
+    return (
+        '<section class="panel">'
+        "<h2>数据口径</h2>"
+        f"<p>当前已导入 {membership_count:,} 条通达信本地主题成员关系；评分口径：{_e(score_date)}；价格口径：{_e(price_as_of_date)} 收盘。</p>"
+        f"<p>仅展示当前评分批次覆盖至少 {min_scored} 只股票的主题。价格表现为成分股等权均值，缺少两个端点收盘价的成分不计入对应周期，不代表主题指数收益或投资结论。</p>"
+        "</section>"
+    )
+
+
+def _render_theme_heat(rows: object) -> str:
+    body = []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            average_score = row.get("average_score")
+            positive_rate = row.get("positive_rate")
+            coverage_rate = row.get("coverage_rate")
+            price_coverage_rate = row.get("price_coverage_rate")
+            positive_rate_text = f"{float(positive_rate):.1f}%" if positive_rate is not None else "-"
+            coverage_rate_text = f"{float(coverage_rate):.1f}%" if coverage_rate is not None else "-"
+            price_coverage_text = (
+                f"{int(row.get('priced_count') or 0)}/{int(row.get('member_count') or 0)} · {float(price_coverage_rate):.1f}%"
+                if price_coverage_rate is not None
+                else "-"
+            )
+            body.append(
+                "<tr>"
+                f"<td>{_e(row.get('category'))}</td>"
+                f"<td>{_e(row.get('theme'))}</td>"
+                f"<td class=\"num\">{int(row.get('member_count') or 0):,}</td>"
+                f"<td class=\"num\">{int(row.get('scored_count') or 0):,}</td>"
+                f"<td class=\"num\">{_e(coverage_rate_text)}</td>"
+                f"<td class=\"num strong\">{_fmt(average_score)}</td>"
+                f"<td class=\"num\">{_e(positive_rate_text)}</td>"
+                f"<td class=\"num\">{_e(price_coverage_text)}</td>"
+                f"<td class=\"num\">{_theme_return_text(row, 1)}</td>"
+                f"<td class=\"num\">{_theme_return_text(row, 5)}</td>"
+                f"<td class=\"num\">{_theme_return_text(row, 20)}</td>"
+                "</tr>"
+            )
+    if not body:
+        body.append('<tr><td colspan="11" class="empty">暂无符合覆盖条件的主题，请先导入主题或降低最低评分覆盖。</td></tr>')
+    return _table_section("主题评分与价格表现", ["类别", "主题", "成员", "评分覆盖", "覆盖率", "平均分", "正分占比", "价格覆盖", "1 日等权", "5 日等权", "20 日等权"], body)
+
+
+def _theme_return_text(row: dict[str, object], horizon_days: int) -> str:
+    value = row.get(f"return_{horizon_days}d")
+    count = int(row.get(f"return_{horizon_days}d_count") or 0)
+    if value is None:
+        return "-"
+    return f"{float(value):+.2f}% ({count})"
 
 
 def _render_factor_definitions() -> str:
@@ -2044,8 +2342,23 @@ def _render_backtest_controls(
     cost_bps: float,
     slippage_bps: float,
     benchmark_symbol: str,
+    benchmark_indices: list[dict[str, object]],
     max_bars: int,
 ) -> str:
+    benchmark_options = [("", "不比较基准")]
+    benchmark_options.extend(
+        (
+            str(item["symbol"]),
+            f"{item['name']}（{item['symbol']}，至 {item['latest_trade_date']}）",
+        )
+        for item in benchmark_indices
+    )
+    if benchmark_symbol and benchmark_symbol not in {item[0] for item in benchmark_options}:
+        benchmark_options.append((benchmark_symbol, f"{benchmark_symbol}（手动代码）"))
+    benchmark_select = "".join(
+        f'<option value="{_e(value)}"{" selected" if value == benchmark_symbol else ""}>{_e(label)}</option>'
+        for value, label in benchmark_options
+    )
     return (
         '<section class="panel filter-panel">'
         '<form class="filters backtest-filters" method="get" action="/backtest">'
@@ -2079,8 +2392,8 @@ def _render_backtest_controls(
         '<label><span>滑点 bps</span>'
         f'<input name="slippage_bps" type="number" min="0" max="200" step="0.1" value="{slippage_bps:g}">'
         "</label>"
-        '<label><span>基准代码</span>'
-        f'<input name="benchmark_symbol" value="{_e(benchmark_symbol)}" placeholder="sh000300">'
+        '<label><span>基准指数</span>'
+        f'<select name="benchmark_symbol">{benchmark_select}</select>'
         "</label>"
         '<label><span>K线数量</span>'
         f'<input name="max_bars" type="number" min="0" max="3000" value="{max_bars}">'
@@ -2718,6 +3031,48 @@ def _render_stock_note(symbol: str, note: object | None) -> str:
         '<button type="submit">保存记录</button>'
         f"{updated}"
         "</form>"
+        "</section>"
+    )
+
+
+def _render_fundamental(row: object | None) -> str:
+    if row is None:
+        return '<section class="panel"><h2>最近财务</h2><p class="empty">暂无财务数据，请导入报告期 CSV 或抓取公开财报。</p></section>'
+    values = [
+        ("营业收入", row["revenue"]),
+        ("营业收入同比", row["revenue_yoy"]),
+        ("净利润", row["net_profit"]),
+        ("归母净利同比", row["net_profit_yoy"]),
+        ("ROE", row["roe"]),
+        ("经营现金流", row["operating_cash_flow"]),
+        ("PE TTM", row["pe_ttm"]),
+        ("PB", row["pb"]),
+    ]
+    body = "".join(
+        "<tr>"
+        f"<td>{_e(label)}</td>"
+        f"<td class=\"num\">{_fmt(value)}</td>"
+        "</tr>"
+        for label, value in values
+    )
+    return (
+        '<section class="panel">'
+        f"<h2>最近财务：{_e(row['report_date'])}</h2>"
+        f"<p>公告日期：{_e(row['notice_date'] or '-')}；金额与比率保持原始 CSV 导出单位或公开接口原始值。带公告日期的营收、利润、ROE、同比和经营现金流会在公告后的下一交易日参与基本面因子。</p>"
+        '<div class="table-wrap"><table><thead><tr><th>指标</th><th>原始值</th></tr></thead>'
+        f"<tbody>{body}</tbody></table></div>"
+        "</section>"
+    )
+
+
+def _render_industry_context(row: object | None) -> str:
+    if row is None:
+        return ""
+    return (
+        '<section class="panel">'
+        "<h2>行业归属</h2>"
+        f"<p><strong>{_e(row['industry'])}</strong> · 更新于 {_e(display_shanghai_time(row['updated_at']))}</p>"
+        "<p>行业标签来自公开公司概况，仅作当前研究上下文，不参与历史因子和策略回测。</p>"
         "</section>"
     )
 

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .ai_decision import analyze_symbol, decisions_to_rows, rank_candidates
 from .factor_engine import factor_definitions
+from .fundamentals import fetch_eastmoney_fundamentals_one, load_fundamentals_csv
 from .field_inference import (
     compare_capture_payloads,
     load_observations,
@@ -16,12 +17,14 @@ from .field_inference import (
 )
 from .history_import import fetch_tencent_daily_bars, load_daily_bars_csv
 from .news_import import fetch_eastmoney_announcements, load_default_ths_news
+from .public_industries import fetch_eastmoney_industry_one
 from .quote_observer import fetch_tencent_observations, write_observations_csv
 from .scoring_profile import load_scoring_profile, write_default_scoring_profile
 from .storage import DEFAULT_DB_PATH, Repository, summarize_ai_decision_outcomes
 from .ths_local import DEFAULT_THS_ROOT, THSLocalAdapter
 from .ths_monitor import inspect_ths_source
 from .tdx_local import DEFAULT_TDX_ROOT, inspect_tdx_daily_status, load_tdx_daily_bars
+from .tdx_blocks import discover_tdx_block_files, load_tdx_theme_memberships
 from .time_utils import display_shanghai_time
 from .web_panel import serve_dashboard
 
@@ -33,6 +36,8 @@ DAILY_AUDIT_EXPORT_TABLES = [
     "watchlists",
     "scores",
     "score_runs",
+    "stock_themes",
+    "stock_industries",
     "stock_notes",
     "ai_decisions",
     "news_items",
@@ -283,6 +288,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     history_parser.add_argument("files", nargs="+", type=Path)
     history_parser.add_argument("--symbol", help="Default symbol when a CSV file does not contain a code column.")
+    fundamentals_parser = subparsers.add_parser(
+        "import-fundamentals",
+        help="Import local financial CSV rows (revenue, profit, ROE, operating cash flow, PE/PB).",
+    )
+    fundamentals_parser.add_argument("files", nargs="+", type=Path)
+    fundamentals_parser.add_argument("--symbol", help="Default symbol when a CSV file does not contain a code column.")
+    public_fundamentals_parser = subparsers.add_parser(
+        "import-public-fundamentals",
+        help="Fetch disclosed revenue, parent net profit, ROE, and operating cash flow from public Eastmoney reports.",
+    )
+    public_fundamentals_parser.add_argument("symbols", nargs="*")
+    public_fundamentals_parser.add_argument("--universe", choices=["auto", "watchlist", "securities", "cache"])
+    public_fundamentals_parser.add_argument("--limit", type=int, default=100)
+    public_fundamentals_parser.add_argument("--reports", type=int, default=8)
+    public_industries_parser = subparsers.add_parser(
+        "import-public-industries",
+        help="Fetch current A-share industry labels from public Eastmoney company profiles.",
+    )
+    public_industries_parser.add_argument("symbols", nargs="*")
+    public_industries_parser.add_argument("--universe", choices=["auto", "watchlist", "securities", "cache"], default="auto")
+    public_industries_parser.add_argument("--limit", type=int, default=100)
     public_history_parser = subparsers.add_parser(
         "import-public-history",
         help="Fetch recent daily bars from public Tencent kline endpoint.",
@@ -312,6 +338,29 @@ def main(argv: list[str] | None = None) -> int:
     )
     tdx_status_parser = subparsers.add_parser("tdx-status", help="Inspect local TDX stock and index daily-bar freshness.")
     tdx_status_parser.add_argument("--tdx-root", type=Path, default=DEFAULT_TDX_ROOT)
+    tdx_blocks_parser = subparsers.add_parser(
+        "import-tdx-blocks",
+        help="Import read-only local TongDaXin concept and style block memberships.",
+    )
+    tdx_blocks_parser.add_argument("--tdx-root", type=Path, default=DEFAULT_TDX_ROOT)
+    tdx_blocks_parser.add_argument(
+        "--kind",
+        action="append",
+        choices=["concept", "style"],
+        help="Repeat to import only selected block kinds. Defaults to both.",
+    )
+    tdx_blocks_status_parser = subparsers.add_parser(
+        "tdx-block-status",
+        help="Inspect available local TongDaXin concept and style block files.",
+    )
+    tdx_blocks_status_parser.add_argument("--tdx-root", type=Path, default=DEFAULT_TDX_ROOT)
+    themes_parser = subparsers.add_parser("themes", help="List theme heat from local TDX memberships and the latest score run.")
+    themes_parser.add_argument("--limit", type=int, default=50)
+    themes_parser.add_argument("--category", choices=["概念", "风格"])
+    themes_parser.add_argument("--min-scored", type=int, default=3, help="Minimum latest-score coverage required for ranking.")
+    industries_parser = subparsers.add_parser("industries", help="List current industry score heat from imported public labels.")
+    industries_parser.add_argument("--limit", type=int, default=50)
+    industries_parser.add_argument("--min-scored", type=int, default=3)
     observe_parser = subparsers.add_parser(
         "auto-observe",
         help="Fetch public quote observations for selected symbols.",
@@ -342,9 +391,42 @@ def main(argv: list[str] | None = None) -> int:
     daily_parser.add_argument("--out-dir", type=Path, default=Path("outputs"))
     daily_parser.add_argument("--universe", choices=["auto", "watchlist", "securities", "cache"], default="auto")
     daily_parser.add_argument("--history-days", type=int, default=80)
+    daily_parser.add_argument(
+        "--public-fundamentals",
+        action="store_true",
+        help="Also fetch disclosed public financial reports for the selected universe.",
+    )
+    daily_parser.add_argument(
+        "--public-fundamental-reports",
+        type=int,
+        default=8,
+        help="Maximum report periods to fetch per symbol when --public-fundamentals is enabled.",
+    )
+    daily_parser.add_argument(
+        "--public-fundamental-limit",
+        type=int,
+        default=100,
+        help="Maximum symbols to fetch when --public-fundamentals is enabled.",
+    )
+    daily_parser.add_argument(
+        "--public-industries",
+        action="store_true",
+        help="Also fetch current public industry labels for the selected universe.",
+    )
+    daily_parser.add_argument(
+        "--public-industry-limit",
+        type=int,
+        default=100,
+        help="Maximum symbols to fetch when --public-industries is enabled.",
+    )
     daily_parser.add_argument("--profile", type=Path, help="Optional JSON scoring profile.")
     daily_parser.add_argument("--tdx-root", type=Path, help="Optional local TongDaXin root for daily-bar synchronization.")
     daily_parser.add_argument("--tdx-include-indices", action="store_true", help="Also synchronize recognized TDX indices.")
+    daily_parser.add_argument(
+        "--tdx-import-themes",
+        action="store_true",
+        help="Also synchronize local TongDaXin concept and style block memberships.",
+    )
     daily_parser.add_argument(
         "--tdx-start-date",
         default="",
@@ -481,6 +563,12 @@ def main(argv: list[str] | None = None) -> int:
             return _observation_template(args.symbols, args.out)
         if args.command == "import-history":
             return _import_history(repo, args.files, args.symbol)
+        if args.command == "import-fundamentals":
+            return _import_fundamentals(repo, args.files, args.symbol)
+        if args.command == "import-public-fundamentals":
+            return _import_public_fundamentals(repo, args.symbols, args.universe, args.limit, args.reports)
+        if args.command == "import-public-industries":
+            return _import_public_industries(repo, args.symbols, args.universe, args.limit)
         if args.command == "import-public-history":
             return _import_public_history(repo, args.symbols, args.universe, args.limit, args.days)
         if args.command == "import-tdx-history":
@@ -496,6 +584,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.command == "tdx-status":
             return _tdx_status(args.tdx_root)
+        if args.command == "import-tdx-blocks":
+            return _import_tdx_blocks(repo, args.tdx_root, args.kind)
+        if args.command == "tdx-block-status":
+            return _tdx_block_status(args.tdx_root)
+        if args.command == "themes":
+            return _themes(repo, args.limit, args.category or "", args.min_scored)
+        if args.command == "industries":
+            return _industries(repo, args.limit, args.min_scored)
         if args.command == "auto-observe":
             return _auto_observe(args.symbols, args.out)
         if args.command == "import-public-quotes":
@@ -510,9 +606,15 @@ def main(argv: list[str] | None = None) -> int:
                 args.out_dir,
                 args.universe,
                 args.history_days,
+                args.public_fundamentals,
+                args.public_fundamental_reports,
+                args.public_fundamental_limit,
+                args.public_industries,
+                args.public_industry_limit,
                 args.profile,
                 args.tdx_root,
                 args.tdx_include_indices,
+                args.tdx_import_themes,
                 args.tdx_start_date,
                 args.public_announcements,
                 args.public_announcement_limit,
@@ -1311,6 +1413,8 @@ def _db_info(repo: Repository) -> int:
 
 def _data_health(repo: Repository) -> int:
     health = repo.daily_bar_health()
+    fundamental_health = repo.fundamental_health()
+    industry_health = repo.industry_health()
     print(f"Daily bar health: {health['status']}")
     print(f"Canonical source precedence: {health['canonical_source_policy']}")
     print(f"Bars: {health['total_bars']}  Symbols: {health['total_symbols']}")
@@ -1327,6 +1431,20 @@ def _data_health(repo: Repository) -> int:
             f"{row['source_kind']}: bars={row['bars']} symbols={row['symbols']} "
             f"range={row['first_trade_date'] or '-'}..{row['last_trade_date'] or '-'}"
         )
+    print(
+        "Financial disclosure health: "
+        f"records={fundamental_health['total_records']} symbols={fundamental_health['total_symbols']} "
+        f"disclosed_symbols={fundamental_health['disclosed_symbols']} "
+        f"cashflow_symbols={fundamental_health['operating_cash_flow_symbols']} "
+        f"latest_notice_date={fundamental_health['latest_disclosed_notice_date'] or '-'}"
+    )
+    print(
+        "Industry label health: "
+        f"labels={industry_health['label_records']} industries={industry_health['industry_count']} "
+        f"scored_symbols={industry_health['scored_symbols']} "
+        f"score_date={industry_health['score_date'] or '-'} "
+        f"latest_updated_at={industry_health['latest_updated_at'] or '-'}"
+    )
     return 0
 
 
@@ -1353,6 +1471,9 @@ def _export(repo: Repository, out_dir: Path, tables: list[str] | None) -> int:
         "scores",
         "score_runs",
         "daily_bars",
+        "fundamentals",
+        "stock_themes",
+        "stock_industries",
         "stock_notes",
         "ai_decisions",
         "news_items",
@@ -1479,6 +1600,85 @@ def _import_history(repo: Repository, files: list[Path], symbol: str | None) -> 
     return 0
 
 
+def _import_fundamentals(repo: Repository, files: list[Path], symbol: str | None) -> int:
+    total = 0
+    for file_path in files:
+        records = load_fundamentals_csv(file_path, default_symbol=symbol)
+        imported = repo.upsert_fundamentals(records)
+        total += imported
+        print(f"Imported {imported} financial records from {file_path}")
+    print("Financial values retain the source CSV unit; no unit conversion was applied.")
+    print(f"Imported total financial records: {total}")
+    return 0 if total else 1
+
+
+def _import_public_fundamentals(
+    repo: Repository,
+    symbols: list[str],
+    universe: str | None,
+    limit: int,
+    reports: int,
+) -> int:
+    selected = sorted(set(symbols))
+    if not selected and universe:
+        source, selected = _select_universe_symbols(repo, universe, limit)
+        print(f"Using {source} universe: {len(selected)} symbols")
+    if not selected:
+        print("No symbols provided. Pass symbols or --universe after running import.")
+        return 1
+    total, failures = _fetch_public_fundamentals(repo, selected[: max(1, limit)], reports)
+    print(f"Fetched public financial records: {total}")
+    if failures:
+        print(f"Public financial fetch failures: {len(failures)} ({'; '.join(failures[:5])})")
+    print("Public fields: report/notice date, revenue and revenue YoY, parent net profit and net profit YoY, weighted ROE, operating cash flow. PE/PB remain unchanged.")
+    return 0 if total else 1
+
+
+def _fetch_public_fundamentals(repo: Repository, symbols: list[str], reports: int) -> tuple[int, list[str]]:
+    total = 0
+    failures: list[str] = []
+    for symbol in symbols:
+        try:
+            records = fetch_eastmoney_fundamentals_one(symbol, reports=reports)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            failures.append(f"{symbol}: {type(error).__name__}")
+            continue
+        total += repo.upsert_fundamentals(records)
+    return total, failures
+
+
+def _import_public_industries(repo: Repository, symbols: list[str], universe: str, limit: int) -> int:
+    selected = sorted(set(symbols))
+    if not selected:
+        source, selected = _select_universe_symbols(repo, universe, None)
+        print(f"Using {source} universe: {len(selected)} available symbols")
+    if not selected:
+        print("No symbols provided. Import securities or pass explicit symbols first.")
+        return 1
+    refresh_symbols = repo.industry_refresh_symbols(selected, limit)
+    print(f"Industry refresh targets: {len(refresh_symbols)} (missing labels first, then oldest)")
+    imported, failures = _fetch_public_industries(repo, refresh_symbols)
+    print(f"Imported public industry labels: {imported}")
+    if failures:
+        print(f"Public industry fetch failures: {len(failures)} ({'; '.join(failures[:5])})")
+    print("Industry labels are current research context only and are not used in historical factor or strategy backtests.")
+    return 0 if imported else 1
+
+
+def _fetch_public_industries(repo: Repository, symbols: list[str]) -> tuple[int, list[str]]:
+    records = []
+    failures: list[str] = []
+    for symbol in symbols:
+        try:
+            record = fetch_eastmoney_industry_one(symbol)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            failures.append(f"{symbol}: {type(error).__name__}")
+            continue
+        if record is not None:
+            records.append(record)
+    return repo.upsert_stock_industries(records), failures
+
+
 def _import_public_history(
     repo: Repository,
     symbols: list[str],
@@ -1550,6 +1750,94 @@ def _tdx_status(tdx_root: Path) -> int:
     return 0 if status.stock_file_count or status.index_file_count else 1
 
 
+def _import_tdx_blocks(repo: Repository, tdx_root: Path, kinds: list[str] | None) -> int:
+    memberships, files = load_tdx_theme_memberships(tdx_root=tdx_root, kinds=kinds)
+    if not files:
+        print(f"No TDX block files found under {tdx_root / 'T0002' / 'hq_cache'}.")
+        return 1
+    imported = repo.replace_stock_themes(memberships, files)
+    by_category: dict[str, set[str]] = {}
+    for item in memberships:
+        by_category.setdefault(item.category, set()).add(item.theme)
+    print(f"TDX root: {tdx_root}")
+    print(f"TDX block files: {', '.join(path.name for path in files)}")
+    print(
+        "Theme memberships: "
+        f"{imported} "
+        + ", ".join(f"{category}={len(themes)} themes" for category, themes in sorted(by_category.items()))
+    )
+    return 0 if imported else 1
+
+
+def _tdx_block_status(tdx_root: Path) -> int:
+    files = discover_tdx_block_files(tdx_root)
+    print(f"TDX root: {tdx_root}")
+    if not files:
+        print("No recognized concept/style block files found.")
+        return 1
+    for kind, category, path in files:
+        print(f"{kind} category={category} size={path.stat().st_size} path={path}")
+    return 0
+
+
+def _themes(repo: Repository, limit: int, category: str, min_scored: int) -> int:
+    summary = repo.theme_heat(limit=limit, category=category, min_scored=min_scored)
+    score_date = summary["score_date"] or "-"
+    price_as_of_date = summary.get("price_as_of_date") or "-"
+    print(
+        f"Theme heat score_date={score_date} price_as_of={price_as_of_date} "
+        f"category={category or '全部'} min_scored={max(1, min_scored)}"
+    )
+    rows = summary["items"]
+    if not isinstance(rows, list) or not rows:
+        print("No theme memberships found. Run import-tdx-blocks first.")
+        return 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        average_score = row["average_score"]
+        positive_rate = row["positive_rate"]
+        coverage_rate = row["coverage_rate"]
+        average_text = f"{float(average_score):.2f}" if average_score is not None else "-"
+        positive_text = f"{float(positive_rate):.1f}%" if positive_rate is not None else "-"
+        returns = " ".join(
+            f"r{days}={float(row[f'return_{days}d']):+.2f}%/{int(row.get(f'return_{days}d_count') or 0)}"
+            if row.get(f"return_{days}d") is not None
+            else f"r{days}=-"
+            for days in (1, 5, 20)
+        )
+        print(
+            f"{row['category']} {row['theme']} members={row['member_count']} scored={row['scored_count']} "
+            f"coverage={float(coverage_rate):.1f}% avg_score={average_text} positive_rate={positive_text} "
+            f"priced={int(row.get('priced_count') or 0)} {returns}"
+        )
+    return 0
+
+
+def _industries(repo: Repository, limit: int, min_scored: int) -> int:
+    summary = repo.industry_heat(limit=limit, min_scored=min_scored)
+    score_date = summary["score_date"] or "-"
+    print(f"Industry heat score_date={score_date} min_scored={max(1, min_scored)}")
+    rows = summary["items"]
+    if not isinstance(rows, list) or not rows:
+        print("No industry heat found. Run import-public-industries and score first.")
+        return 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        average_score = row["average_score"]
+        positive_rate = row["positive_rate"]
+        coverage_rate = row["coverage_rate"]
+        average_text = f"{float(average_score):.2f}" if average_score is not None else "-"
+        positive_text = f"{float(positive_rate):.1f}%" if positive_rate is not None else "-"
+        coverage_text = f"{float(coverage_rate):.1f}%" if coverage_rate is not None else "-"
+        print(
+            f"{row['industry']} members={row['member_count']} scored={row['scored_count']} "
+            f"coverage={coverage_text} avg_score={average_text} positive_rate={positive_text}"
+        )
+    return 0
+
+
 def _auto_observe(symbols: list[str], out: Path) -> int:
     observations = fetch_tencent_observations(symbols)
     write_observations_csv(out, observations)
@@ -1590,7 +1878,7 @@ def _import_public_quotes(
     return 0 if imported else 1
 
 
-def _select_universe_symbols(repo: Repository, universe: str, limit: int) -> tuple[str, list[str]]:
+def _select_universe_symbols(repo: Repository, universe: str, limit: int | None) -> tuple[str, list[str]]:
     if universe == "auto":
         return repo.list_auto_universe_symbols(limit=limit)
     if universe == "watchlist":
@@ -1650,9 +1938,15 @@ def _run_daily(
     out_dir: Path,
     universe: str,
     history_days: int,
+    public_fundamentals: bool = False,
+    public_fundamental_reports: int = 8,
+    public_fundamental_limit: int = 100,
+    public_industries: bool = False,
+    public_industry_limit: int = 100,
     profile_path: Path | None = None,
     tdx_root: Path | None = None,
     tdx_include_indices: bool = False,
+    tdx_import_themes: bool = False,
     tdx_start_date: str = "",
     public_announcements: bool = False,
     public_announcement_limit: int = 30,
@@ -1663,9 +1957,15 @@ def _run_daily(
         "out_dir": str(out_dir),
         "universe": universe,
         "history_days": history_days,
+        "public_fundamentals": public_fundamentals,
+        "public_fundamental_reports": public_fundamental_reports if public_fundamentals else None,
+        "public_fundamental_limit": public_fundamental_limit if public_fundamentals else None,
+        "public_industries": public_industries,
+        "public_industry_limit": public_industry_limit if public_industries else None,
         "profile": str(profile_path) if profile_path is not None else None,
         "tdx_root": str(tdx_root) if tdx_root is not None else None,
         "tdx_include_indices": tdx_include_indices,
+        "tdx_import_themes": tdx_import_themes,
         "tdx_start_date": tdx_start_date or None,
         "public_announcements": public_announcements,
         "public_announcement_limit": public_announcement_limit,
@@ -1673,9 +1973,14 @@ def _run_daily(
     }
     run_id = repo.start_daily_run(parameters)
     summary: dict[str, object] = {"run_id": run_id}
-    total_steps = 8 if tdx_root is not None else 7
-    if public_announcements:
-        total_steps += 1
+    total_steps = (
+        7
+        + int(public_fundamentals)
+        + int(public_industries)
+        + int(public_announcements)
+        + int(tdx_root is not None)
+        + int(tdx_root is not None and tdx_import_themes)
+    )
     next_step = 1
     current_step = "import_tdx_history" if tdx_root is not None else "import_local_cache"
     try:
@@ -1687,6 +1992,17 @@ def _run_daily(
                 summary.update({"failed_step": current_step, "return_code": tdx_code})
                 repo.finish_daily_run(run_id, "failed", summary, f"{current_step} returned {tdx_code}")
                 return tdx_code
+            next_step += 1
+
+        if tdx_root is not None and tdx_import_themes:
+            current_step = "import_tdx_themes"
+            print(f"Step {next_step}/{total_steps}: importing TongDaXin local themes")
+            themes_code, themes_summary = _sync_tdx_themes(repo, tdx_root)
+            summary.update(themes_summary)
+            if themes_code != 0:
+                summary.update({"failed_step": current_step, "return_code": themes_code})
+                repo.finish_daily_run(run_id, "failed", summary, f"{current_step} returned {themes_code}")
+                return themes_code
             next_step += 1
 
         current_step = "import_local_cache"
@@ -1764,6 +2080,42 @@ def _run_daily(
             bars = []
             print("Skipped public daily bars: all selected symbols already have TDX history.")
 
+        public_fundamentals_imported = 0
+        public_fundamentals_failures: list[str] = []
+        if public_fundamentals:
+            current_step = "import_public_fundamentals"
+            next_step += 1
+            print(f"Step {next_step}/{total_steps}: fetching public financial reports")
+            public_fundamental_symbols = history_symbols[: max(1, public_fundamental_limit)]
+            print(f"Using {len(public_fundamental_symbols)} of {len(history_symbols)} selected symbols for public financial reports")
+            public_fundamentals_imported, public_fundamentals_failures = _fetch_public_fundamentals(
+                repo,
+                public_fundamental_symbols,
+                public_fundamental_reports,
+            )
+            print(f"Fetched public financial records: {public_fundamentals_imported}")
+            if public_fundamentals_failures:
+                print(
+                    f"Public financial fetch failures: {len(public_fundamentals_failures)} "
+                    f"({'; '.join(public_fundamentals_failures[:5])})"
+                )
+
+        public_industries_imported = 0
+        public_industries_failures: list[str] = []
+        if public_industries:
+            current_step = "import_public_industries"
+            next_step += 1
+            print(f"Step {next_step}/{total_steps}: fetching public industry labels")
+            public_industry_symbols = repo.industry_refresh_symbols(history_symbols, public_industry_limit)
+            print(f"Using {len(public_industry_symbols)} of {len(history_symbols)} selected symbols for public industry labels")
+            public_industries_imported, public_industries_failures = _fetch_public_industries(repo, public_industry_symbols)
+            print(f"Imported public industry labels: {public_industries_imported}")
+            if public_industries_failures:
+                print(
+                    f"Public industry fetch failures: {len(public_industries_failures)} "
+                    f"({'; '.join(public_industries_failures[:5])})"
+                )
+
         current_step = "score"
         next_step += 1
         print(f"Step {next_step}/{total_steps}: scoring")
@@ -1805,6 +2157,7 @@ def _run_daily(
         _report(repo, min(20, limit), 1.0, report_path)
         health = repo.daily_bar_health()
         quote_health = repo.quote_health()
+        fundamental_health = repo.fundamental_health()
         summary.update(
             {
                 "universe_source": source,
@@ -1812,6 +2165,16 @@ def _run_daily(
                 "tdx_covered_symbols": tdx_covered_symbols,
                 "public_history_symbols": len(public_history_symbols),
                 "history_bars_imported": len(bars),
+                "public_fundamentals_enabled": public_fundamentals,
+                "public_fundamental_symbols_requested": len(public_fundamental_symbols) if public_fundamentals else 0,
+                "public_fundamentals_imported": public_fundamentals_imported,
+                "public_fundamentals_failures": len(public_fundamentals_failures),
+                "public_fundamentals_failure_samples": public_fundamentals_failures[:5],
+                "public_industries_enabled": public_industries,
+                "public_industry_symbols_requested": len(public_industry_symbols) if public_industries else 0,
+                "public_industries_imported": public_industries_imported,
+                "public_industries_failures": len(public_industries_failures),
+                "public_industries_failure_samples": public_industries_failures[:5],
                 "score_return_code": score_code,
                 "daily_audit_export_tables": DAILY_AUDIT_EXPORT_TABLES,
                 "artifacts": [str(observations_path), str(candidates_path), str(report_path)],
@@ -1832,6 +2195,7 @@ def _run_daily(
                     "weekday_lag_days": quote_health["weekday_lag_days"],
                     "freshness_checked_on": quote_health["freshness_checked_on"],
                 },
+                "fundamental_health": fundamental_health,
             }
         )
         repo.finish_daily_run(run_id, "succeeded", summary)
@@ -1883,6 +2247,26 @@ def _sync_tdx_daily_bars(
         f"date_range={first_date}->{last_date} start_date={start_date or '-'}"
     )
     return 0, summary
+
+
+def _sync_tdx_themes(repo: Repository, tdx_root: Path) -> tuple[int, dict[str, object]]:
+    memberships, files = load_tdx_theme_memberships(tdx_root=tdx_root)
+    summary: dict[str, object] = {
+        "tdx_theme_files": [str(path) for path in files],
+        "tdx_theme_memberships_loaded": len(memberships),
+        "tdx_theme_memberships_imported": 0,
+    }
+    if not files:
+        print(f"No TDX block files found under {tdx_root / 'T0002' / 'hq_cache'}.")
+        return 1, summary
+    imported = repo.replace_stock_themes(memberships, files)
+    summary["tdx_theme_memberships_imported"] = imported
+    categories = sorted({item.category for item in memberships})
+    print(
+        f"TDX themes: files={len(files)} memberships={len(memberships)} imported={imported} "
+        f"categories={','.join(categories) or '-'}"
+    )
+    return 0 if imported else 1, summary
 
 
 def _daily_runs(repo: Repository, limit: int) -> int:

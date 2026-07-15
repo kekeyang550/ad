@@ -8,15 +8,26 @@ import math
 from datetime import date, timedelta
 from pathlib import Path
 
-from .factor_engine import FactorSignal, evaluate_factors, factor_definitions
+from .factor_engine import FACTOR_ENGINE_VERSION, FactorSignal, evaluate_disclosed_fundamental, evaluate_factors, factor_definitions
+from .fundamentals import FundamentalRecord
 from .history_import import DailyBar
 from .models import NewsItem, QuoteRealtime, Security, SnapshotDiagnostics, WatchlistEntry
 from .quote_observer import QuoteObservation
+from .public_industries import IndustryClassification
 from .scoring_profile import ScoringProfile, default_scoring_profile
+from .tdx_blocks import ThemeMembership
 
 DEFAULT_DB_PATH = Path("work/ths_stock_picker.db")
-CANONICAL_DAILY_BAR_POLICY_VERSION = 1
 SQLITE_BUSY_TIMEOUT_SECONDS = 30
+CANONICAL_DAILY_BAR_POLICY_VERSION = 1
+BENCHMARK_INDEX_LABELS = {
+    "sh000001": "上证指数",
+    "sh000016": "上证50",
+    "sh000300": "沪深300",
+    "sz399001": "深证成指",
+    "sz399006": "创业板指",
+    "sh000688": "科创50",
+}
 
 
 class Repository:
@@ -130,6 +141,51 @@ class Repository:
             CREATE INDEX IF NOT EXISTS idx_daily_bars_trade_date_symbol
                 ON daily_bars(trade_date DESC, symbol);
 
+            CREATE TABLE IF NOT EXISTS fundamentals (
+                symbol TEXT NOT NULL,
+                report_date TEXT NOT NULL,
+                notice_date TEXT,
+                revenue REAL,
+                revenue_yoy REAL,
+                net_profit REAL,
+                net_profit_yoy REAL,
+                roe REAL,
+                operating_cash_flow REAL,
+                pe_ttm REAL,
+                pb REAL,
+                source_file TEXT NOT NULL,
+                imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (symbol, report_date, source_file)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_fundamentals_symbol_report_date
+                ON fundamentals(symbol, report_date DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_fundamentals_symbol_notice_date
+                ON fundamentals(symbol, notice_date DESC);
+
+            CREATE TABLE IF NOT EXISTS stock_themes (
+                symbol TEXT NOT NULL,
+                category TEXT NOT NULL,
+                theme TEXT NOT NULL,
+                source_file TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (symbol, category, theme, source_file)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_stock_themes_symbol
+                ON stock_themes(symbol, category, theme);
+
+            CREATE TABLE IF NOT EXISTS stock_industries (
+                symbol TEXT PRIMARY KEY,
+                industry TEXT NOT NULL,
+                source_file TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_stock_industries_industry
+                ON stock_industries(industry, symbol);
+
             CREATE TABLE IF NOT EXISTS stock_notes (
                 symbol TEXT PRIMARY KEY,
                 status TEXT NOT NULL DEFAULT 'watch',
@@ -180,6 +236,20 @@ class Repository:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS theme_price_cache (
+                cache_key TEXT PRIMARY KEY,
+                source_fingerprint TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_bar_health_cache (
+                cache_key TEXT PRIMARY KEY,
+                source_fingerprint TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS data_versions (
                 dataset TEXT PRIMARY KEY,
                 version INTEGER NOT NULL DEFAULT 0,
@@ -226,6 +296,8 @@ class Repository:
                 ON daily_runs(started_at DESC);
 
             INSERT OR IGNORE INTO data_versions (dataset, version) VALUES ('daily_bars', 0);
+            INSERT OR IGNORE INTO data_versions (dataset, version) VALUES ('stock_themes', 0);
+            INSERT OR IGNORE INTO data_versions (dataset, version) VALUES ('fundamentals', 0);
             """
         )
         self._ensure_columns(
@@ -249,6 +321,14 @@ class Repository:
             {
                 "score_run_id": "INTEGER",
                 "profile_name": "TEXT",
+            },
+        )
+        self._ensure_columns(
+            "fundamentals",
+            {
+                "notice_date": "TEXT",
+                "revenue_yoy": "REAL",
+                "net_profit_yoy": "REAL",
             },
         )
         self.conn.commit()
@@ -640,11 +720,16 @@ class Repository:
             "scores",
             "score_runs",
             "daily_bars",
+            "fundamentals",
+            "stock_themes",
+            "stock_industries",
             "stock_notes",
             "ai_decisions",
             "news_items",
             "factor_backtest_cache",
             "factor_scan_cache",
+            "theme_price_cache",
+            "daily_bar_health_cache",
             "strategy_backtest_runs",
             "daily_runs",
         ]
@@ -753,7 +838,44 @@ class Repository:
             "freshness_checked_on": checked_on.isoformat(),
         }
 
+    def fundamental_health(self, as_of: date | None = None) -> dict[str, object]:
+        checked_on = as_of or date.today()
+        as_of_date = checked_on.isoformat()
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS total_records,
+                   COUNT(DISTINCT symbol) AS total_symbols,
+                   COUNT(DISTINCT CASE WHEN notice_date IS NOT NULL AND notice_date < ? THEN symbol END) AS disclosed_symbols,
+                   COUNT(CASE WHEN notice_date IS NOT NULL AND notice_date < ? THEN 1 END) AS disclosed_records,
+                   COUNT(DISTINCT CASE WHEN operating_cash_flow IS NOT NULL AND notice_date IS NOT NULL AND notice_date < ? THEN symbol END) AS operating_cash_flow_symbols,
+                   COUNT(CASE WHEN operating_cash_flow IS NOT NULL AND notice_date IS NOT NULL AND notice_date < ? THEN 1 END) AS operating_cash_flow_records,
+                   MAX(report_date) AS latest_imported_report_date,
+                   MAX(CASE WHEN notice_date IS NOT NULL AND notice_date < ? THEN report_date END) AS latest_disclosed_report_date,
+                   MAX(CASE WHEN notice_date IS NOT NULL AND notice_date < ? THEN notice_date END) AS latest_disclosed_notice_date,
+                   COUNT(DISTINCT source_file) AS source_count
+            FROM fundamentals
+            """,
+            (as_of_date, as_of_date, as_of_date, as_of_date, as_of_date, as_of_date),
+        ).fetchone()
+        return {
+            "as_of_date": as_of_date,
+            "total_records": int(row["total_records"] or 0),
+            "total_symbols": int(row["total_symbols"] or 0),
+            "disclosed_symbols": int(row["disclosed_symbols"] or 0),
+            "disclosed_records": int(row["disclosed_records"] or 0),
+            "operating_cash_flow_symbols": int(row["operating_cash_flow_symbols"] or 0),
+            "operating_cash_flow_records": int(row["operating_cash_flow_records"] or 0),
+            "latest_imported_report_date": row["latest_imported_report_date"],
+            "latest_disclosed_report_date": row["latest_disclosed_report_date"],
+            "latest_disclosed_notice_date": row["latest_disclosed_notice_date"],
+            "source_count": int(row["source_count"] or 0),
+        }
+
     def daily_bar_health(self, as_of: date | None = None) -> dict[str, object]:
+        checked_on = as_of or date.today()
+        cached = self._load_daily_bar_health_cache(checked_on)
+        if cached is not None:
+            return cached
         source_rows = self.conn.execute(
             """
             SELECT CASE
@@ -803,7 +925,6 @@ class Repository:
         ).fetchone()
         latest_stock_trade_date = str(latest_stock_row["latest_trade_date"] or "")
         latest_trade_date = latest_stock_trade_date or latest_any_trade_date
-        checked_on = as_of or date.today()
         weekday_lag_days = _weekday_lag_days(latest_trade_date, checked_on)
         freshness_status = (
             "empty"
@@ -814,7 +935,7 @@ class Repository:
             if weekday_lag_days <= 1
             else "lagging"
         )
-        return {
+        health = {
             "status": "empty" if total_bars == 0 else "attention" if duplicate_symbol_days else "clean",
             "total_bars": total_bars,
             "total_symbols": total_symbols,
@@ -829,6 +950,54 @@ class Repository:
             "canonical_source_policy": "tdx_unadjusted > csv_or_other > tencent_qfq",
             "sources": sources,
         }
+        self._save_daily_bar_health_cache(checked_on, health)
+        return health
+
+    def _load_daily_bar_health_cache(self, checked_on: date) -> dict[str, object] | None:
+        row = self.conn.execute(
+            "SELECT payload_json, source_fingerprint FROM daily_bar_health_cache WHERE cache_key = ?",
+            (self._daily_bar_health_cache_key(checked_on),),
+        ).fetchone()
+        if row is None or row["source_fingerprint"] != self._daily_bar_health_fingerprint():
+            return None
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict) or not isinstance(payload.get("sources"), list):
+            return None
+        return payload
+
+    def _save_daily_bar_health_cache(self, checked_on: date, health: dict[str, object]) -> None:
+        fingerprint = self._daily_bar_health_fingerprint()
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM daily_bar_health_cache WHERE source_fingerprint != ?",
+                (fingerprint,),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO daily_bar_health_cache (cache_key, source_fingerprint, payload_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    source_fingerprint = excluded.source_fingerprint,
+                    payload_json = excluded.payload_json,
+                    created_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    self._daily_bar_health_cache_key(checked_on),
+                    fingerprint,
+                    json.dumps(health, ensure_ascii=False),
+                ),
+            )
+
+    def _daily_bar_health_cache_key(self, checked_on: date) -> str:
+        return f"checked_on={checked_on.isoformat()}"
+
+    def _daily_bar_health_fingerprint(self) -> str:
+        row = self.conn.execute("SELECT version FROM data_versions WHERE dataset = 'daily_bars'").fetchone()
+        version = int(row["version"]) if row is not None else 0
+        return f"daily_bars_v={version}|canonical_policy_v={CANONICAL_DAILY_BAR_POLICY_VERSION}|health_cache_v=1"
 
     def export_table_csv(self, table: str, output_path: Path) -> int:
         allowed = {
@@ -839,11 +1008,16 @@ class Repository:
             "scores",
             "score_runs",
             "daily_bars",
+            "fundamentals",
+            "stock_themes",
+            "stock_industries",
             "stock_notes",
             "ai_decisions",
             "news_items",
             "factor_backtest_cache",
             "factor_scan_cache",
+            "theme_price_cache",
+            "daily_bar_health_cache",
             "strategy_validation_runs",
             "strategy_backtest_runs",
             "daily_runs",
@@ -897,6 +1071,497 @@ class Repository:
             if bars:
                 self._bump_data_version("daily_bars")
         return len(bars)
+
+    def upsert_fundamentals(self, records: list[FundamentalRecord]) -> int:
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT INTO fundamentals
+                    (symbol, report_date, notice_date, revenue, revenue_yoy, net_profit, net_profit_yoy, roe, operating_cash_flow, pe_ttm, pb, source_file)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, report_date, source_file) DO UPDATE SET
+                    notice_date = excluded.notice_date,
+                    revenue = excluded.revenue,
+                    revenue_yoy = excluded.revenue_yoy,
+                    net_profit = excluded.net_profit,
+                    net_profit_yoy = excluded.net_profit_yoy,
+                    roe = excluded.roe,
+                    operating_cash_flow = excluded.operating_cash_flow,
+                    pe_ttm = excluded.pe_ttm,
+                    pb = excluded.pb,
+                    imported_at = CURRENT_TIMESTAMP
+                """,
+                [
+                    (
+                        item.symbol,
+                        item.report_date,
+                        item.notice_date,
+                        item.revenue,
+                        item.revenue_yoy,
+                        item.net_profit,
+                        item.net_profit_yoy,
+                        item.roe,
+                        item.operating_cash_flow,
+                        item.pe_ttm,
+                        item.pb,
+                        str(item.source_file),
+                    )
+                    for item in records
+                ],
+            )
+            if records:
+                self._bump_data_version("fundamentals")
+        return len(records)
+
+    def latest_fundamental(self, symbol: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            SELECT symbol, report_date, notice_date, revenue, revenue_yoy, net_profit, net_profit_yoy, roe, operating_cash_flow, pe_ttm, pb, source_file, imported_at
+            FROM fundamentals
+            WHERE symbol = ?
+            ORDER BY
+                report_date DESC,
+                (revenue IS NOT NULL) + (revenue_yoy IS NOT NULL) + (net_profit IS NOT NULL) + (net_profit_yoy IS NOT NULL) + (roe IS NOT NULL)
+                    + (operating_cash_flow IS NOT NULL) + (pe_ttm IS NOT NULL) + (pb IS NOT NULL) DESC,
+                notice_date DESC,
+                imported_at DESC,
+                source_file
+            LIMIT 1
+            """,
+            (symbol,),
+        ).fetchone()
+
+    def disclosed_fundamental_as_of(self, symbol: str, signal_date: str) -> dict[str, object] | None:
+        """Return the latest report known before a date-only market signal, merged across sources."""
+        return _disclosed_fundamental_at(self._disclosed_fundamentals_for_symbol(symbol), signal_date)
+
+    def _disclosed_fundamentals_for_symbol(self, symbol: str) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT symbol, report_date, notice_date, revenue, revenue_yoy, net_profit, net_profit_yoy, roe, operating_cash_flow, pe_ttm, pb, source_file, imported_at
+            FROM fundamentals
+            WHERE symbol = ?
+              AND notice_date IS NOT NULL
+            """,
+            (symbol,),
+        ).fetchall()
+
+    def replace_stock_themes(self, memberships: list[ThemeMembership], source_files: list[Path]) -> int:
+        source_values = sorted({str(path) for path in source_files})
+        with self.conn:
+            if source_values:
+                placeholders = ", ".join("?" for _ in source_values)
+                self.conn.execute(f"DELETE FROM stock_themes WHERE source_file IN ({placeholders})", tuple(source_values))
+            if memberships:
+                self.conn.executemany(
+                    """
+                    INSERT INTO stock_themes (symbol, category, theme, source_file)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(symbol, category, theme, source_file) DO UPDATE SET
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    [(item.symbol, item.category, item.theme, str(item.source_file)) for item in memberships],
+                )
+            if source_values:
+                self._bump_data_version("stock_themes")
+        return len(memberships)
+
+    def themes_for_symbol(self, symbol: str, limit: int = 30) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT category, theme, source_file, MAX(updated_at) AS updated_at
+            FROM stock_themes
+            WHERE symbol = ?
+            GROUP BY category, theme, source_file
+            ORDER BY CASE category WHEN '概念' THEN 0 WHEN '风格' THEN 1 ELSE 9 END, theme
+            LIMIT ?
+            """,
+            (symbol, max(1, limit)),
+        ).fetchall()
+
+    def replace_stock_industries(self, records: list[IndustryClassification]) -> int:
+        if not records:
+            return 0
+        source_values = sorted({str(record.source_file) for record in records})
+        with self.conn:
+            placeholders = ", ".join("?" for _ in source_values)
+            self.conn.execute(f"DELETE FROM stock_industries WHERE source_file IN ({placeholders})", tuple(source_values))
+            self.conn.executemany(
+                """
+                INSERT INTO stock_industries (symbol, industry, source_file)
+                VALUES (?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    industry = excluded.industry,
+                    source_file = excluded.source_file,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                [(record.symbol, record.industry, str(record.source_file)) for record in records],
+            )
+        return len(records)
+
+    def upsert_stock_industries(self, records: list[IndustryClassification]) -> int:
+        if not records:
+            return 0
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT INTO stock_industries (symbol, industry, source_file)
+                VALUES (?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    industry = excluded.industry,
+                    source_file = excluded.source_file,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                [(record.symbol, record.industry, str(record.source_file)) for record in records],
+            )
+        return len(records)
+
+    def industry_for_symbol(self, symbol: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT symbol, industry, source_file, updated_at FROM stock_industries WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+
+    def industry_refresh_symbols(self, symbols: list[str], limit: int) -> list[str]:
+        """Pick missing labels first, then refresh the oldest existing labels."""
+        candidates = list(dict.fromkeys(symbols))
+        if not candidates:
+            return []
+        existing: dict[str, str] = {}
+        for offset in range(0, len(candidates), 900):
+            chunk = candidates[offset : offset + 900]
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self.conn.execute(
+                f"SELECT symbol, updated_at FROM stock_industries WHERE symbol IN ({placeholders})",
+                tuple(chunk),
+            ).fetchall()
+            existing.update({str(row["symbol"]): str(row["updated_at"] or "") for row in rows})
+        ranked = sorted(
+            enumerate(candidates),
+            key=lambda item: (
+                0 if item[1] not in existing else 1,
+                existing.get(item[1], ""),
+                item[0],
+            ),
+        )
+        return [symbol for _, symbol in ranked[: max(1, limit)]]
+
+    def industry_health(self) -> dict[str, object]:
+        latest_run = self.conn.execute("SELECT id, score_date FROM score_runs ORDER BY id DESC LIMIT 1").fetchone()
+        score_run_id = int(latest_run["id"]) if latest_run is not None else -1
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS label_records,
+                   COUNT(DISTINCT i.industry) AS industry_count,
+                   COUNT(s.symbol) AS scored_symbols,
+                   MAX(i.updated_at) AS latest_updated_at
+            FROM stock_industries i
+            LEFT JOIN scores s ON s.symbol = i.symbol AND s.score_run_id = ?
+            """,
+            (score_run_id,),
+        ).fetchone()
+        return {
+            "label_records": int(row["label_records"] or 0),
+            "industry_count": int(row["industry_count"] or 0),
+            "scored_symbols": int(row["scored_symbols"] or 0),
+            "latest_updated_at": row["latest_updated_at"],
+            "score_date": str(latest_run["score_date"]) if latest_run is not None else None,
+        }
+
+    def industry_heat(self, limit: int = 50, min_scored: int = 3) -> dict[str, object]:
+        latest_run = self.conn.execute("SELECT id, score_date FROM score_runs ORDER BY id DESC LIMIT 1").fetchone()
+        score_run_id = int(latest_run["id"]) if latest_run is not None else -1
+        rows = self.conn.execute(
+            """
+            SELECT i.industry,
+                   COUNT(*) AS member_count,
+                   COUNT(s.symbol) AS scored_count,
+                   AVG(s.total_score) AS average_score,
+                   SUM(CASE WHEN s.total_score > 0 THEN 1 ELSE 0 END) AS positive_count
+            FROM stock_industries i
+            LEFT JOIN scores s ON s.symbol = i.symbol AND s.score_run_id = ?
+            GROUP BY i.industry
+            HAVING COUNT(s.symbol) >= ?
+            ORDER BY AVG(s.total_score) DESC, COUNT(s.symbol) DESC, COUNT(*) DESC, i.industry
+            LIMIT ?
+            """,
+            (score_run_id, max(1, min_scored), max(1, limit)),
+        ).fetchall()
+        items = []
+        for row in rows:
+            member_count = int(row["member_count"] or 0)
+            scored_count = int(row["scored_count"] or 0)
+            positive_count = int(row["positive_count"] or 0)
+            items.append(
+                {
+                    "industry": str(row["industry"]),
+                    "member_count": member_count,
+                    "scored_count": scored_count,
+                    "coverage_rate": scored_count / member_count * 100 if member_count else None,
+                    "average_score": float(row["average_score"]) if row["average_score"] is not None else None,
+                    "positive_rate": positive_count / scored_count * 100 if scored_count else None,
+                }
+            )
+        return {
+            "score_date": str(latest_run["score_date"]) if latest_run is not None else None,
+            "min_scored": max(1, min_scored),
+            "items": items,
+        }
+
+    def theme_heat(self, limit: int = 50, category: str = "", min_scored: int = 3) -> dict[str, object]:
+        latest_run = self.conn.execute(
+            "SELECT id, score_date FROM score_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        score_run_id = int(latest_run["id"]) if latest_run is not None else -1
+        price_as_of_date, price_performance = self._theme_price_performance(category)
+        where_clause = "WHERE t.category = ?" if category else ""
+        parameters: list[object] = [score_run_id]
+        if category:
+            parameters.append(category)
+        parameters.append(max(1, min_scored))
+        parameters.append(max(1, limit))
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                t.category,
+                t.theme,
+                COUNT(DISTINCT t.symbol) AS member_count,
+                COUNT(DISTINCT s.symbol) AS scored_count,
+                AVG(s.total_score) AS average_score,
+                SUM(CASE WHEN s.total_score > 0 THEN 1 ELSE 0 END) AS positive_count
+            FROM stock_themes t
+            LEFT JOIN scores s ON s.symbol = t.symbol AND s.score_run_id = ?
+            {where_clause}
+            GROUP BY t.category, t.theme
+            HAVING COUNT(DISTINCT s.symbol) >= ?
+            ORDER BY
+                CASE WHEN AVG(s.total_score) IS NULL THEN 1 ELSE 0 END,
+                AVG(s.total_score) DESC,
+                COUNT(DISTINCT s.symbol) DESC,
+                COUNT(DISTINCT t.symbol) DESC,
+                t.theme
+            LIMIT ?
+            """,
+            tuple(parameters),
+        ).fetchall()
+        items = []
+        for row in rows:
+            scored_count = int(row["scored_count"] or 0)
+            positive_count = int(row["positive_count"] or 0)
+            items.append(
+                {
+                    "category": str(row["category"]),
+                    "theme": str(row["theme"]),
+                    "member_count": int(row["member_count"] or 0),
+                    "scored_count": scored_count,
+                    "average_score": float(row["average_score"]) if row["average_score"] is not None else None,
+                    "positive_rate": positive_count / scored_count * 100 if scored_count else None,
+                    "coverage_rate": scored_count / int(row["member_count"] or 1) * 100,
+                    **price_performance.get((str(row["category"]), str(row["theme"])), {}),
+                }
+            )
+        return {
+            "score_date": str(latest_run["score_date"]) if latest_run is not None else None,
+            "price_as_of_date": price_as_of_date,
+            "min_scored": max(1, min_scored),
+            "items": items,
+        }
+
+    def _theme_price_performance(self, category: str = "") -> tuple[str | None, dict[tuple[str, str], dict[str, object]]]:
+        cached = self._load_theme_price_cache(category)
+        if cached is not None:
+            return cached
+        dates = self._recent_stock_trade_dates(21)
+        if len(dates) < 21:
+            return None, {}
+        category_clause = "WHERE category = ?" if category else ""
+        params: list[object] = []
+        if category:
+            params.append(category)
+        params.extend(dates)
+        params.extend((dates[0], dates[1], dates[5], dates[20]))
+        date_placeholders = ", ".join("?" for _ in dates)
+        rows = self.conn.execute(
+            f"""
+            WITH theme_members AS (
+                SELECT DISTINCT symbol, category, theme
+                FROM stock_themes
+                {category_clause}
+            ),
+            theme_symbols AS (
+                SELECT DISTINCT symbol FROM theme_members
+            ),
+            ranked AS (
+                SELECT b.symbol,
+                       b.trade_date,
+                       b.close,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY b.symbol, b.trade_date
+                           ORDER BY CASE
+                                        WHEN lower(b.source_file) LIKE 'tdx:%' THEN 0
+                                        WHEN lower(b.source_file) LIKE 'tencent:%' THEN 2
+                                        ELSE 1
+                                    END,
+                                    b.imported_at DESC,
+                                    b.source_file ASC
+                       ) AS source_rank
+                FROM daily_bars b
+                INNER JOIN theme_symbols symbols ON symbols.symbol = b.symbol
+                WHERE b.trade_date IN ({date_placeholders})
+                  AND b.close IS NOT NULL
+            ),
+            canonical AS (
+                SELECT symbol, trade_date, close
+                FROM ranked
+                WHERE source_rank = 1
+            ),
+            price_snapshot AS (
+                SELECT symbol,
+                       MAX(CASE WHEN trade_date = ? THEN close END) AS close_now,
+                       MAX(CASE WHEN trade_date = ? THEN close END) AS close_1d,
+                       MAX(CASE WHEN trade_date = ? THEN close END) AS close_5d,
+                       MAX(CASE WHEN trade_date = ? THEN close END) AS close_20d
+                FROM canonical
+                GROUP BY symbol
+            )
+            SELECT t.category,
+                   t.theme,
+                   COUNT(*) AS member_count,
+                   COUNT(CASE WHEN p.close_now > 0 THEN 1 END) AS priced_count,
+                   COUNT(CASE WHEN p.close_now > 0 AND p.close_1d > 0 THEN 1 END) AS return_1d_count,
+                   COUNT(CASE WHEN p.close_now > 0 AND p.close_5d > 0 THEN 1 END) AS return_5d_count,
+                   COUNT(CASE WHEN p.close_now > 0 AND p.close_20d > 0 THEN 1 END) AS return_20d_count,
+                   AVG(CASE WHEN p.close_now > 0 AND p.close_1d > 0 THEN (p.close_now / p.close_1d - 1) * 100 END) AS return_1d,
+                   AVG(CASE WHEN p.close_now > 0 AND p.close_5d > 0 THEN (p.close_now / p.close_5d - 1) * 100 END) AS return_5d,
+                   AVG(CASE WHEN p.close_now > 0 AND p.close_20d > 0 THEN (p.close_now / p.close_20d - 1) * 100 END) AS return_20d
+            FROM theme_members t
+            LEFT JOIN price_snapshot p ON p.symbol = t.symbol
+            GROUP BY t.category, t.theme
+            """,
+            tuple(params),
+        ).fetchall()
+        performance: dict[tuple[str, str], dict[str, object]] = {}
+        for row in rows:
+            member_count = int(row["member_count"] or 0)
+            priced_count = int(row["priced_count"] or 0)
+            performance[(str(row["category"]), str(row["theme"]))] = {
+                "priced_count": priced_count,
+                "price_coverage_rate": priced_count / member_count * 100 if member_count else None,
+                "return_1d": float(row["return_1d"]) if row["return_1d"] is not None else None,
+                "return_1d_count": int(row["return_1d_count"] or 0),
+                "return_5d": float(row["return_5d"]) if row["return_5d"] is not None else None,
+                "return_5d_count": int(row["return_5d_count"] or 0),
+                "return_20d": float(row["return_20d"]) if row["return_20d"] is not None else None,
+                "return_20d_count": int(row["return_20d_count"] or 0),
+            }
+        self._save_theme_price_cache(category, dates[0], performance)
+        return dates[0], performance
+
+    def _load_theme_price_cache(self, category: str) -> tuple[str | None, dict[tuple[str, str], dict[str, object]]] | None:
+        row = self.conn.execute(
+            "SELECT payload_json, source_fingerprint FROM theme_price_cache WHERE cache_key = ?",
+            (self._theme_price_cache_key(category),),
+        ).fetchone()
+        if row is None or row["source_fingerprint"] != self._theme_price_fingerprint():
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            return None
+        performance: dict[tuple[str, str], dict[str, object]] = {}
+        for item in payload["items"]:
+            if not isinstance(item, dict):
+                continue
+            item_category = item.get("category")
+            item_theme = item.get("theme")
+            if isinstance(item_category, str) and isinstance(item_theme, str):
+                performance[(item_category, item_theme)] = {
+                    key: value for key, value in item.items() if key not in {"category", "theme"}
+                }
+        return payload.get("price_as_of_date") if isinstance(payload.get("price_as_of_date"), str) else None, performance
+
+    def _save_theme_price_cache(
+        self,
+        category: str,
+        price_as_of_date: str,
+        performance: dict[tuple[str, str], dict[str, object]],
+    ) -> None:
+        items = [
+            {"category": item_category, "theme": item_theme, **values}
+            for (item_category, item_theme), values in performance.items()
+        ]
+        payload = {"price_as_of_date": price_as_of_date, "items": items}
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO theme_price_cache (cache_key, source_fingerprint, payload_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    source_fingerprint = excluded.source_fingerprint,
+                    payload_json = excluded.payload_json,
+                    created_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    self._theme_price_cache_key(category),
+                    self._theme_price_fingerprint(),
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+
+    def _theme_price_cache_key(self, category: str) -> str:
+        return f"category={category or 'all'}|horizons=1,5,20"
+
+    def _theme_price_fingerprint(self) -> str:
+        versions = {
+            str(row["dataset"]): int(row["version"])
+            for row in self.conn.execute(
+                "SELECT dataset, version FROM data_versions WHERE dataset IN ('daily_bars', 'stock_themes')"
+            ).fetchall()
+        }
+        return (
+            f"daily_bars_v={versions.get('daily_bars', 0)}|stock_themes_v={versions.get('stock_themes', 0)}"
+            f"|canonical_policy_v={CANONICAL_DAILY_BAR_POLICY_VERSION}|theme_price_v=1"
+        )
+
+    def _recent_stock_trade_dates(self, limit: int) -> list[str]:
+        recent_rows = self.conn.execute(
+            """
+            SELECT DISTINCT trade_date
+            FROM daily_bars
+            WHERE trade_date >= date((SELECT MAX(trade_date) FROM daily_bars), '-45 days')
+              AND close IS NOT NULL
+              AND (
+                  symbol GLOB '60[0-9][0-9][0-9][0-9]' OR
+                  symbol GLOB '68[0-9][0-9][0-9][0-9]' OR
+                  symbol GLOB '00[0-9][0-9][0-9][0-9]' OR
+                  symbol GLOB '30[0-9][0-9][0-9][0-9]'
+              )
+            ORDER BY trade_date DESC
+            LIMIT ?
+            """,
+            (max(1, limit),),
+        ).fetchall()
+        if len(recent_rows) >= limit:
+            return [str(row["trade_date"]) for row in recent_rows]
+        rows = self.conn.execute(
+            """
+            SELECT DISTINCT trade_date
+            FROM daily_bars
+            WHERE close IS NOT NULL
+              AND (
+                  symbol GLOB '60[0-9][0-9][0-9][0-9]' OR
+                  symbol GLOB '68[0-9][0-9][0-9][0-9]' OR
+                  symbol GLOB '00[0-9][0-9][0-9][0-9]' OR
+                  symbol GLOB '30[0-9][0-9][0-9][0-9]'
+              )
+            ORDER BY trade_date DESC
+            LIMIT ?
+            """,
+            (max(1, limit),),
+        ).fetchall()
+        return [str(row["trade_date"]) for row in rows]
 
     def delete_daily_bars_for_symbols(self, symbols: list[str]) -> int:
         selected = sorted({str(symbol) for symbol in symbols if symbol})
@@ -1184,6 +1849,28 @@ class Repository:
         ).fetchall()
         return [row["symbol"] for row in rows]
 
+    def available_benchmark_indices(self) -> list[dict[str, object]]:
+        symbols = list(BENCHMARK_INDEX_LABELS)
+        placeholders = ", ".join("?" for _ in symbols)
+        rows = self.conn.execute(
+            f"""
+            SELECT symbol, MAX(trade_date) AS latest_trade_date
+            FROM daily_bars
+            WHERE symbol IN ({placeholders})
+            GROUP BY symbol
+            ORDER BY symbol
+            """,
+            tuple(symbols),
+        ).fetchall()
+        return [
+            {
+                "symbol": str(row["symbol"]),
+                "name": BENCHMARK_INDEX_LABELS[str(row["symbol"])],
+                "latest_trade_date": str(row["latest_trade_date"]),
+            }
+            for row in rows
+        ]
+
     def symbols_without_tdx_daily_bars(self, symbols: list[str]) -> list[str]:
         selected = list(dict.fromkeys(symbol.strip() for symbol in symbols if symbol.strip()))
         if not selected:
@@ -1220,6 +1907,9 @@ class Repository:
         for symbol in selected:
             bars = self.daily_bars_for_symbol(symbol, limit=80)
             signals = evaluate_factors(bars)
+            if bars:
+                signal_date = str(bars[-1]["trade_date"])
+                signals.extend(evaluate_disclosed_fundamental(self.disclosed_fundamental_as_of(symbol, signal_date), signal_date))
             if not signals:
                 continue
             quote = self.latest_quote_for_symbol(symbol)
@@ -1272,16 +1962,20 @@ class Repository:
         }
         for symbol in self.symbols_with_daily_bars(limit=limit_symbols):
             bars = self.daily_bars_for_symbol(symbol, limit=max_bars, end_date=end_date)
+            fundamentals = self._disclosed_fundamentals_for_symbol(symbol)
             if len(bars) < max(min_bars, 20 + horizon_days):
                 continue
             for index in range(19, len(bars) - horizon_days):
                 window = bars[: index + 1]
+                signal_date = str(window[-1]["trade_date"])
                 close_now = window[-1]["close"]
                 close_future = bars[index + horizon_days]["close"]
                 if close_now in (None, 0) or close_future is None:
                     continue
                 forward_return = (float(close_future) / float(close_now) - 1) * 100
-                for signal in evaluate_factors(window):
+                signals = evaluate_factors(window)
+                signals.extend(evaluate_disclosed_fundamental(_disclosed_fundamental_at(fundamentals, signal_date), signal_date))
+                for signal in signals:
                     row = stats[signal.factor_id]
                     row["direction"] = signal.direction
                     row["samples"] = int(row["samples"]) + 1
@@ -1571,7 +2265,12 @@ class Repository:
     def _daily_bar_fingerprint(self) -> str:
         row = self.conn.execute("SELECT version FROM data_versions WHERE dataset = 'daily_bars'").fetchone()
         version = int(row["version"]) if row is not None else 0
-        return f"daily_bars_v={version}|canonical_policy_v={CANONICAL_DAILY_BAR_POLICY_VERSION}"
+        fundamentals_row = self.conn.execute("SELECT version FROM data_versions WHERE dataset = 'fundamentals'").fetchone()
+        fundamentals_version = int(fundamentals_row["version"]) if fundamentals_row is not None else 0
+        return (
+            f"daily_bars_v={version}|canonical_policy_v={CANONICAL_DAILY_BAR_POLICY_VERSION}"
+            f"|fundamentals_v={fundamentals_version}|factor_engine_v={FACTOR_ENGINE_VERSION}"
+        )
 
     def _bump_data_version(self, dataset: str) -> None:
         self.conn.execute(
@@ -1623,6 +2322,7 @@ class Repository:
             if benchmark_code and symbol == benchmark_code:
                 continue
             bars = self.daily_bars_for_symbol(symbol, limit=max_bars)
+            fundamentals = self._disclosed_fundamentals_for_symbol(symbol)
             if len(bars) < 20 + horizon_days:
                 continue
             for index in range(19, len(bars) - horizon_days):
@@ -1656,6 +2356,7 @@ class Repository:
                     continue
                 entry_date = str(bars[entry_index]["trade_date"])
                 signals = evaluate_factors(window)
+                signals.extend(evaluate_disclosed_fundamental(_disclosed_fundamental_at(fundamentals, signal_date), signal_date))
                 signals.extend(relative_strength_signals.get((signal_date, symbol), []))
                 positive = [item for item in signals if item.direction == "positive"]
                 risk = [item for item in signals if item.direction == "risk"]
@@ -2536,6 +3237,7 @@ class Repository:
     def write_daily_report(self, output_path: Path, limit: int = 20, min_score: float = 1.0) -> int:
         rows = self.latest_candidates(limit=limit, min_score=min_score)
         counts = self.table_counts()
+        industry_heat = self.industry_heat(limit=5, min_scored=2)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         lines = [
             "# A 股选股日报",
@@ -2545,6 +3247,7 @@ class Repository:
             f"- 证券基础表: {counts['securities']}",
             f"- 实时行情记录: {counts['quotes_realtime']}",
             f"- 评分记录: {counts['scores']}",
+            f"- 已导入行业归属: {counts['stock_industries']}",
             "",
             "## 候选榜",
             "",
@@ -2572,6 +3275,29 @@ class Repository:
                     news=news_text,
                 )
             )
+        if industry_heat["items"]:
+            lines.extend(
+                [
+                    "",
+                    "## 当前行业热度",
+                    "",
+                    f"- 评分日期: {industry_heat['score_date'] or '-'}",
+                    "- 仅展示当前评分批次覆盖至少 2 只股票的行业；行业标签仅作当前研究上下文，不参与历史回测。",
+                    "",
+                    "| 行业 | 成员 | 评分覆盖 | 平均分 | 正分占比 |",
+                    "| --- | ---: | ---: | ---: | ---: |",
+                ]
+            )
+            for item in industry_heat["items"]:
+                lines.append(
+                    "| {industry} | {members} | {scored} | {average:.2f} | {positive:.1f}% |".format(
+                        industry=str(item["industry"]).replace("|", "/"),
+                        members=int(item["member_count"]),
+                        scored=int(item["scored_count"]),
+                        average=float(item["average_score"] or 0),
+                        positive=float(item["positive_rate"] or 0),
+                    )
+                )
         lines.extend(
             [
                 "",
@@ -3218,6 +3944,37 @@ def _strategy_signal_strength(signal: FactorSignal) -> float:
 
 def _bounded(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def _disclosed_fundamental_at(rows: list[sqlite3.Row], signal_date: str) -> dict[str, object] | None:
+    eligible = [
+        row
+        for row in rows
+        if str(row["notice_date"] or "") < signal_date and str(row["report_date"] or "") <= signal_date
+    ]
+    if not eligible:
+        return None
+    report_date = max(str(row["report_date"] or "") for row in eligible)
+    latest_period_rows = [row for row in eligible if str(row["report_date"] or "") == report_date]
+    fields = ("revenue", "revenue_yoy", "net_profit", "net_profit_yoy", "roe", "operating_cash_flow", "pe_ttm", "pb")
+    preferred = sorted(
+        latest_period_rows,
+        key=lambda row: (
+            sum(row[key] is not None for key in fields),
+            str(row["notice_date"] or ""),
+            str(row["imported_at"] or ""),
+            str(row["source_file"] or ""),
+        ),
+        reverse=True,
+    )
+    snapshot: dict[str, object] = {
+        "symbol": preferred[0]["symbol"],
+        "report_date": report_date,
+        "notice_date": max(str(row["notice_date"] or "") for row in latest_period_rows),
+    }
+    for field in fields:
+        snapshot[field] = next((row[field] for row in preferred if row[field] is not None), None)
+    return snapshot
 
 
 def _percentile_rank(values: dict[str, object]) -> dict[str, float]:
