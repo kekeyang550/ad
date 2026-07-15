@@ -2510,12 +2510,21 @@ class StorageCliTests(unittest.TestCase):
 
             self.assertIn("本地观察池", html_all)
             self.assertIn("中芯国际", html_all)
+            self.assertIn("行情时间", html_all)
+            self.assertIn("2026-07-08 10:52:47", html_all)
             self.assertIn("复盘放量", html_review)
             self.assertNotIn("中芯国际", html_watch)
             self.assertIn("/export/notes.csv", html_query)
             self.assertIn("/notes/delete", html_query)
             self.assertIn("pct_change", csv_text)
+            self.assertIn("quote_observed_at", csv_text)
+            self.assertIn("2026-07-08 10:52:47", csv_text)
             self.assertIn("688981", csv_text)
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(main(["--db", str(db), "notes", "--status", "review"]), 0)
+            self.assertIn("quote_observed_at=2026-07-08 10:52:47", output.getvalue())
 
     def test_scoring_uses_daily_bar_trend_factors(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3119,6 +3128,9 @@ class StorageCliTests(unittest.TestCase):
             self.assertNotIn("*ST康佳A", candidates_text)
             report_text = report_path.read_text(encoding="utf-8")
             self.assertIn("# A 股选股日报", report_text)
+            self.assertIn("行情时间", report_text)
+            self.assertIn("2026-07-08 10:52:47", report_text)
+            self.assertIn("单只报价观测时间", report_text)
             self.assertIn("消息面", report_text)
             self.assertIn("1条：平安银行:关于投资者关系活动记录表", report_text)
             self.assertIn("## 当前行业热度", report_text)

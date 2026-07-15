@@ -237,7 +237,21 @@ def render_notes_csv(repo: Repository, limit: int = 1000, filters: NotesFilters 
     )
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow(["symbol", "name", "board", "status", "tags", "note", "total_score", "latest_price", "pct_change", "updated_at"])
+    writer.writerow(
+        [
+            "symbol",
+            "name",
+            "board",
+            "status",
+            "tags",
+            "note",
+            "total_score",
+            "latest_price",
+            "pct_change",
+            "quote_observed_at",
+            "updated_at",
+        ]
+    )
     for row in rows:
         writer.writerow(
             [
@@ -250,6 +264,7 @@ def render_notes_csv(repo: Repository, limit: int = 1000, filters: NotesFilters 
                 row["total_score"],
                 row["latest_price"],
                 row["pct_change"],
+                row["observed_at"],
                 row["updated_at"],
             ]
         )
@@ -3255,6 +3270,7 @@ def _render_notes_table(rows: list[object], filters: NotesFilters) -> str:
             f"<td class=\"num\">{_fmt(row['total_score'])}</td>"
             f"<td class=\"num\">{_fmt(row['latest_price'])}</td>"
             f"<td class=\"num\">{_fmt(row['pct_change'])}%</td>"
+            f"<td>{_e(row['observed_at'] or '-')}</td>"
             f"<td>{_e(display_shanghai_time(row['updated_at']))}</td>"
             '<td class="action-cell">'
             '<form class="inline-form" method="post" action="/notes/delete">'
@@ -3266,8 +3282,12 @@ def _render_notes_table(rows: list[object], filters: NotesFilters) -> str:
             "</tr>"
         )
     if not body:
-        body.append('<tr><td colspan="11" class="empty">暂无观察记录。</td></tr>')
-    return _table_section("观察记录", ["代码", "名称", "板块", "状态", "标签", "备注", "分数", "现价", "涨跌幅", "更新时间", "操作"], body)
+        body.append('<tr><td colspan="12" class="empty">暂无观察记录。</td></tr>')
+    return _table_section(
+        "观察记录",
+        ["代码", "名称", "板块", "状态", "标签", "备注", "分数", "现价", "涨跌幅", "行情时间", "更新时间", "操作"],
+        body,
+    )
 
 
 def _status_label(status: object) -> str:

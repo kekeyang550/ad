@@ -2836,6 +2836,7 @@ class Repository:
             f"""
             SELECT n.symbol, n.status, n.tags, n.note, n.updated_at,
                    q.name, q.board, q.latest_price, q.pct_change,
+                   q.observed_at,
                    s.total_score
             FROM stock_notes n
             LEFT JOIN quotes_realtime q ON q.symbol = n.symbol AND q.latest_price IS NOT NULL
@@ -3265,8 +3266,8 @@ class Repository:
             "",
             "## 候选榜",
             "",
-            "| 排名 | 代码 | 名称 | 板块 | 分数 | 现价 | 涨跌幅 | 成交额 | 总市值 | 换手率 | 主要理由 | 消息面 |",
-            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+            "| 排名 | 代码 | 名称 | 板块 | 分数 | 现价 | 涨跌幅 | 成交额 | 总市值 | 换手率 | 行情时间 | 主要理由 | 消息面 |",
+            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
         ]
         for index, row in enumerate(rows, start=1):
             rules = json.loads(row["triggered_rules_json"])
@@ -3274,7 +3275,7 @@ class Repository:
                 self.related_news_for_symbol(str(row["symbol"]), name=row["name"], limit=3)
             )
             lines.append(
-                "| {rank} | {symbol} | {name} | {board} | {score:.2f} | {price:.2f} | {pct:.2f}% | {amount:.0f} | {market_cap:.2f}亿 | {turnover:.2f}% | {rules} | {news} |".format(
+                "| {rank} | {symbol} | {name} | {board} | {score:.2f} | {price:.2f} | {pct:.2f}% | {amount:.0f} | {market_cap:.2f}亿 | {turnover:.2f}% | {observed_at} | {rules} | {news} |".format(
                     rank=index,
                     symbol=row["symbol"],
                     name=(row["name"] or "").replace("|", "/"),
@@ -3285,6 +3286,7 @@ class Repository:
                     amount=row["amount"] or 0,
                     market_cap=(row["market_cap"] or 0) / 100_000_000,
                     turnover=row["turnover_rate"] or 0,
+                    observed_at=str(row["observed_at"] or "-").replace("|", "/"),
                     rules=", ".join(rules[:4]).replace("|", "/"),
                     news=news_text,
                 )
@@ -3320,6 +3322,7 @@ class Repository:
                 "- 本报告用于个人投研辅助，不构成投资建议。",
                 "- 候选池已排除 ST/PT/退市名称风险、0 价格和非正分股票。",
                 "- 实时价格来自公开行情补充源；同花顺本地缓存用于证券池、名称、市场和诊断。",
+                "- 候选榜的行情时间为单只报价观测时间，应结合数据时效判断，不等同于报告生成时间。",
                 "- 消息面列来自同花顺本地资讯缓存和公开公告兜底，只作复核线索。",
             ]
         )

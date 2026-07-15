@@ -1274,7 +1274,8 @@ def _notes(repo: Repository, limit: int, status: str | None = None, query: str =
         print(
             f"{row['symbol']} {row['name'] or '-'} {row['status']} "
             f"score={_fmt_number(row['total_score'])} price={_fmt_number(row['latest_price'])} "
-            f"tags={row['tags'] or '-'} note={row['note'] or '-'} updated_at={display_shanghai_time(row['updated_at'])}"
+            f"quote_observed_at={row['observed_at'] or '-'} tags={row['tags'] or '-'} "
+            f"note={row['note'] or '-'} updated_at={display_shanghai_time(row['updated_at'])}"
         )
     return 0
 
