@@ -2245,6 +2245,20 @@ def _run_daily(
 
 
 def _save_daily_strategy_snapshot(repo: Repository) -> dict[str, object]:
+    health = repo.daily_bar_health()
+    freshness = str(health.get("freshness_status") or "unknown")
+    latest_trade_date = str(health.get("latest_trade_date") or "-")
+    if freshness != "current":
+        print(
+            f"Strategy snapshot skipped: daily bars freshness={freshness} "
+            f"latest_trade_date={latest_trade_date}"
+        )
+        return {
+            "strategy_snapshot_enabled": True,
+            "strategy_snapshot_status": "skipped_stale_daily_bars",
+            "strategy_snapshot_daily_bar_freshness": freshness,
+            "strategy_snapshot_latest_trade_date": latest_trade_date,
+        }
     options = dict(DAILY_STRATEGY_SNAPSHOT_OPTIONS)
     result = repo.strategy_backtest(**options)
     parameters = {**options, "source": "daily_run_strategy_snapshot"}

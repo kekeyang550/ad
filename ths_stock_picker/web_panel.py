@@ -1984,6 +1984,14 @@ def _daily_run_strategy_snapshot_label(summary: dict[str, object]) -> str:
         return "已保存 " + " · ".join(parts)
     if status == "failed":
         return "失败，不影响数据更新"
+    if status == "skipped_stale_daily_bars":
+        freshness = str(summary.get("strategy_snapshot_daily_bar_freshness") or "unknown")
+        latest_date = str(summary.get("strategy_snapshot_latest_trade_date") or "-")
+        if freshness == "lagging":
+            return f"日线滞后至 {latest_date}，未保存"
+        if freshness == "empty":
+            return "暂无日线，未保存"
+        return f"日线状态 {freshness}，未保存"
     return "-"
 
 

@@ -1208,8 +1208,20 @@ class StorageCliTests(unittest.TestCase):
             "portfolio_avg_return": 1.25,
             "max_drawdown": -4.5,
         }
-        scenarios = [("saved", {"return_value": snapshot_result}), ("failed", {"side_effect": RuntimeError("backtest unavailable")})]
-        for expected_status, backtest_patch in scenarios:
+        healthy_daily_bars = {
+            "status": "clean",
+            "latest_trade_date": "2026-07-15",
+            "freshness_status": "current",
+            "weekday_lag_days": 0,
+            "freshness_checked_on": "2026-07-15",
+        }
+        stale_daily_bars = {**healthy_daily_bars, "latest_trade_date": "2026-07-08", "freshness_status": "lagging", "weekday_lag_days": 5}
+        scenarios = [
+            ("saved", healthy_daily_bars, {"return_value": snapshot_result}),
+            ("failed", healthy_daily_bars, {"side_effect": RuntimeError("backtest unavailable")}),
+            ("skipped_stale_daily_bars", stale_daily_bars, {"return_value": snapshot_result}),
+        ]
+        for expected_status, daily_bar_health, backtest_patch in scenarios:
             with self.subTest(status=expected_status), tempfile.TemporaryDirectory() as temp_dir:
                 root = Path(temp_dir)
                 db = root / "picker.db"
@@ -1219,6 +1231,7 @@ class StorageCliTests(unittest.TestCase):
                     patch("ths_stock_picker.cli._import_public_quotes", return_value=0),
                     patch("ths_stock_picker.cli._select_universe_symbols", return_value=("test", [])),
                     patch("ths_stock_picker.cli._export", return_value=0),
+                    patch.object(Repository, "daily_bar_health", return_value=daily_bar_health),
                     patch.object(Repository, "strategy_backtest", **backtest_patch) as backtest_mock,
                     patch.object(Repository, "save_strategy_backtest_run", return_value=42) as save_mock,
                     redirect_stdout(output),
@@ -1264,11 +1277,17 @@ class StorageCliTests(unittest.TestCase):
                     self.assertEqual(saved_parameters["source"], "daily_run_strategy_snapshot")
                     self.assertIn("已保存 #42 · 12 笔 · 组合 +1.25%", html)
                     self.assertIn("Saved strategy snapshot", output.getvalue())
-                else:
+                elif expected_status == "failed":
                     save_mock.assert_not_called()
                     self.assertIn("RuntimeError: backtest unavailable", summary["strategy_snapshot_error"])
                     self.assertIn("失败，不影响数据更新", html)
                     self.assertIn("Strategy snapshot skipped", output.getvalue())
+                else:
+                    backtest_mock.assert_not_called()
+                    save_mock.assert_not_called()
+                    self.assertEqual(summary["strategy_snapshot_latest_trade_date"], "2026-07-08")
+                    self.assertIn("日线滞后至 2026-07-08，未保存", html)
+                    self.assertIn("Strategy snapshot skipped: daily bars freshness=lagging", output.getvalue())
 
     def test_run_daily_public_announcements_failure_is_non_blocking(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
