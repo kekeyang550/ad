@@ -1,6 +1,6 @@
 # A 股 AI 选股项目交接记录
 
-更新时间：2026-07-14
+更新时间：2026-07-15
 
 ## 项目位置
 
@@ -250,7 +250,7 @@ verdict=未通过
 - `import-public-industries --universe auto --limit 100` 会逐只补充东财三级行业，按成功记录增量写入，不会因单个网络失败删除已有归属。批量更新会优先覆盖缺失标签，再按最旧更新时间刷新已有标签，避免反复请求同一批代码。`industries` 和 Web `/industries` 会按最新评分聚合行业覆盖、平均分和正分占比；行业不参与历史因子、策略回测或样本外验证。
 - `run-daily --tdx-root D:\new_tdx --tdx-import-themes` 会在日线同步后更新主题缓存，并把导入数量保存到每日运行记录。
 - `run-daily --public-fundamentals --public-fundamental-limit 100 --public-fundamental-reports 8` 可在公开日线后按当前股票池抓取财报；这是显式开关，默认最多请求 100 只股票，单个代码网络失败只记录在每日运行中，不阻断行情、评分和报告。`--public-industries --public-industry-limit 100` 可按同一股票池更新当前公开三级行业。Web `/daily-runs` 会显示公开财报和公开行业的请求数、导入量与失败数。
-- `run-daily --strategy-snapshot` 会在评分和 AI 快照后，按固定的保守研究口径保存一条策略回测记录：持有 5 日、Top 10、因子分至少 60、最多 300 个标的和 260 根日线、单边成本与滑点各 5bps、沪深 300 基准、次日开盘成交且不重叠持仓。该步骤是显式开关，并且只在日线时效为 `current` 时运行；滞后或为空会明确记为未保存，快照异常也只写入每日记录而不阻断数据更新。Web `/daily-runs` 和 CLI `daily-runs` 会显示快照状态、保存回测编号和交易样本数。
+- `run-daily` 的自动 AI 快照和显式 `--strategy-snapshot` 都只在日线时效为 `current` 时保存；滞后或为空会明确记为未保存，避免历史复盘和策略记录混入伪当日信号。手动 `ai-pick --save` 仍可用于历史研究。策略快照按固定保守口径保存：持有 5 日、Top 10、因子分至少 60、最多 300 个标的和 260 根日线、单边成本与滑点各 5bps、沪深 300 基准、次日开盘成交且不重叠持仓。快照异常也只写入每日记录而不阻断数据更新。Web `/daily-runs` 和 CLI `daily-runs` 会显示快照状态、原因、保存回测编号和交易样本数。
 - 2026-07-14 已实机运行 `run-daily --limit 5 --public-industries --public-industry-limit 5`：5 个行业标签全部导入，`stock_industries.csv`、候选池、日报和 AI 快照均已生成，运行记录为成功。
 - `report` 与每日生成的 `daily_report.md` 会在至少两只当前评分股票拥有相同行业归属时，列出最多五个行业热度条目；该栏目仅用于观察候选池行业集中度，不参与候选评分或回测。
 
@@ -374,7 +374,7 @@ python -m unittest discover -s tests
 当前测试数量：
 
 ```text
-112 tests
+113 tests
 ```
 
 最近一次测试结果：通过。

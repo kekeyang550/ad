@@ -985,8 +985,9 @@ class StorageCliTests(unittest.TestCase):
         self.assertEqual(summary["daily_bar_health"]["latest_trade_date"], "2026-07-09")
         self.assertIn(summary["daily_bar_health"]["freshness_status"], {"current", "lagging", "unknown"})
         self.assertEqual(summary["quote_health"]["freshness_status"], "empty")
-        self.assertEqual(summary["ai_snapshot_status"], "empty")
+        self.assertEqual(summary["ai_snapshot_status"], "skipped_stale_daily_bars")
         self.assertEqual(summary["ai_decisions_saved"], 0)
+        self.assertEqual(summary["ai_snapshot_latest_trade_date"], "2026-07-09")
         self.assertEqual(summary["daily_audit_export_tables"], exported_tables)
         self.assertNotIn("daily_bars", exported_tables)
         self.assertIn("scores", exported_tables)
@@ -999,6 +1000,7 @@ class StorageCliTests(unittest.TestCase):
         self.assertIn("行情时效", daily_runs_html)
         self.assertIn("AI 快照", daily_runs_html)
         self.assertIn("2026-07-09", daily_runs_html)
+        self.assertIn("日线滞后至 2026-07-09，未保存", daily_runs_html)
 
     def test_run_daily_optionally_imports_public_fundamentals_and_records_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1153,11 +1155,20 @@ class StorageCliTests(unittest.TestCase):
             next_actions=["测试动作"],
             evidence={},
         )
+        healthy_daily_bars = {
+            "status": "clean",
+            "latest_trade_date": "2026-07-15",
+            "freshness_status": "current",
+            "weekday_lag_days": 0,
+            "freshness_checked_on": "2026-07-15",
+        }
+        stale_daily_bars = {**healthy_daily_bars, "latest_trade_date": "2026-07-08", "freshness_status": "lagging", "weekday_lag_days": 5}
         scenarios = [
-            ("saved", {"return_value": [decision]}, 1),
-            ("failed", {"side_effect": RuntimeError("AI unavailable")}, 0),
+            ("saved", healthy_daily_bars, {"return_value": [decision]}, 1),
+            ("failed", healthy_daily_bars, {"side_effect": RuntimeError("AI unavailable")}, 0),
+            ("skipped_stale_daily_bars", stale_daily_bars, {"return_value": [decision]}, 0),
         ]
-        for expected_status, rank_patch, expected_rows in scenarios:
+        for expected_status, daily_bar_health, rank_patch, expected_rows in scenarios:
             with self.subTest(status=expected_status), tempfile.TemporaryDirectory() as temp_dir:
                 root = Path(temp_dir)
                 db = root / "picker.db"
@@ -1167,7 +1178,8 @@ class StorageCliTests(unittest.TestCase):
                     patch("ths_stock_picker.cli._import_public_quotes", return_value=0),
                     patch("ths_stock_picker.cli._select_universe_symbols", return_value=("test", [])),
                     patch("ths_stock_picker.cli._export", return_value=0),
-                    patch("ths_stock_picker.cli.rank_candidates", **rank_patch),
+                    patch.object(Repository, "daily_bar_health", return_value=daily_bar_health),
+                    patch("ths_stock_picker.cli.rank_candidates", **rank_patch) as rank_mock,
                     redirect_stdout(output),
                 ):
                     self.assertEqual(
@@ -1192,6 +1204,7 @@ class StorageCliTests(unittest.TestCase):
                     repo.init_schema()
                     summary = json.loads(repo.daily_runs(limit=1)[0]["summary_json"])
                     rows = repo.latest_ai_decisions(limit=5)
+                    html = render_daily_runs_page(repo)
                 finally:
                     repo.close()
 
@@ -1201,6 +1214,11 @@ class StorageCliTests(unittest.TestCase):
                 if expected_status == "failed":
                     self.assertIn("RuntimeError: AI unavailable", summary["ai_snapshot_error"])
                     self.assertIn("AI snapshot skipped", output.getvalue())
+                elif expected_status == "skipped_stale_daily_bars":
+                    rank_mock.assert_not_called()
+                    self.assertEqual(summary["ai_snapshot_latest_trade_date"], "2026-07-08")
+                    self.assertIn("日线滞后至 2026-07-08，未保存", html)
+                    self.assertIn("AI snapshot skipped: daily bars freshness=lagging", output.getvalue())
 
     def test_run_daily_optionally_saves_a_non_blocking_strategy_snapshot(self) -> None:
         snapshot_result = {

@@ -2157,17 +2157,7 @@ def _run_daily(
         next_step += 1
         print(f"Step {next_step}/{total_steps}: saving AI snapshot")
         try:
-            decisions = rank_candidates(repo, limit=min(30, limit), min_score=1.0)
-            saved_ai_decisions = (
-                repo.insert_ai_decisions(decisions_to_rows(decisions), replace_same_signal=True) if decisions else 0
-            )
-            summary.update(
-                {
-                    "ai_snapshot_status": "saved" if saved_ai_decisions else "empty",
-                    "ai_decisions_saved": saved_ai_decisions,
-                }
-            )
-            print(f"Saved AI snapshot decisions: {saved_ai_decisions}")
+            summary.update(_save_daily_ai_snapshot(repo, limit))
         except Exception as error:
             summary.update(
                 {
@@ -2251,6 +2241,32 @@ def _run_daily(
         summary["failed_step"] = current_step
         repo.finish_daily_run(run_id, "failed", summary, f"{type(error).__name__}: {error}")
         raise
+
+
+def _save_daily_ai_snapshot(repo: Repository, limit: int) -> dict[str, object]:
+    health = repo.daily_bar_health()
+    freshness = str(health.get("freshness_status") or "unknown")
+    latest_trade_date = str(health.get("latest_trade_date") or "-")
+    if freshness != "current":
+        print(
+            f"AI snapshot skipped: daily bars freshness={freshness} "
+            f"latest_trade_date={latest_trade_date}"
+        )
+        return {
+            "ai_snapshot_status": "skipped_stale_daily_bars",
+            "ai_decisions_saved": 0,
+            "ai_snapshot_daily_bar_freshness": freshness,
+            "ai_snapshot_latest_trade_date": latest_trade_date,
+        }
+    decisions = rank_candidates(repo, limit=min(30, limit), min_score=1.0)
+    saved_ai_decisions = (
+        repo.insert_ai_decisions(decisions_to_rows(decisions), replace_same_signal=True) if decisions else 0
+    )
+    print(f"Saved AI snapshot decisions: {saved_ai_decisions}")
+    return {
+        "ai_snapshot_status": "saved" if saved_ai_decisions else "empty",
+        "ai_decisions_saved": saved_ai_decisions,
+    }
 
 
 def _save_daily_strategy_snapshot(repo: Repository) -> dict[str, object]:
@@ -2374,6 +2390,7 @@ def _daily_runs(repo: Repository, limit: int) -> int:
                     quote_freshness = str(quote_health.get("freshness_status") or "-")
                 ai_snapshot = str(summary.get("ai_snapshot_status") or "-")
                 ai_saved = int(summary.get("ai_decisions_saved") or 0)
+                ai_snapshot_latest_date = str(summary.get("ai_snapshot_latest_trade_date") or "-")
                 announcement_status = str(summary.get("public_announcement_status") or "-")
                 announcement_count = int(summary.get("public_announcements_imported") or 0)
                 strategy_snapshot_status = str(summary.get("strategy_snapshot_status") or "-")
@@ -2385,7 +2402,7 @@ def _daily_runs(repo: Repository, limit: int) -> int:
                     f"tdx_covered={summary.get('tdx_covered_symbols', 0)} "
                     f"tdx_sync_bars={summary.get('tdx_daily_bars_imported', 0)} "
                     f"daily_freshness={freshness} quote_freshness={quote_freshness} "
-                    f"ai_snapshot={ai_snapshot}:{ai_saved} "
+                    f"ai_snapshot={ai_snapshot}:{ai_saved}:{ai_snapshot_latest_date} "
                     f"strategy_snapshot={strategy_snapshot_status}:{strategy_snapshot_run_id}:{strategy_snapshot_trades} "
                     f"announcements={announcement_status}:{announcement_count}"
                 )
