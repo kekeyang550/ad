@@ -399,7 +399,7 @@ class StorageCliTests(unittest.TestCase):
                     [
                         DailyBar(
                             symbol="000001",
-                            trade_date="2026-07-14",
+                            trade_date=date.today().isoformat(),
                             open=10.0,
                             high=10.2,
                             low=9.8,
@@ -458,7 +458,7 @@ class StorageCliTests(unittest.TestCase):
                     high=price + 0.3,
                     low=price - 0.4,
                     previous_close=price - 0.5,
-                    observed_at="2026-07-15 15:05:00",
+                    observed_at=f"{date.today().isoformat()} 15:05:00",
                     source="test",
                     market_cap=100_000_000_000,
                     turnover_rate=1.2,
@@ -496,7 +496,7 @@ class StorageCliTests(unittest.TestCase):
                     [
                         DailyBar(
                             symbol=symbol,
-                            trade_date="2026-07-15",
+                            trade_date=date.today().isoformat(),
                             open=10.0,
                             high=10.5,
                             low=9.8,
@@ -525,6 +525,21 @@ class StorageCliTests(unittest.TestCase):
                     "ths_stock_picker.cli.fetch_eastmoney_industry_one",
                     side_effect=lambda symbol: IndustryClassification(symbol, "银行"),
                 ) as industries_mock,
+                patch(
+                    "ths_stock_picker.cli.fetch_eastmoney_announcements",
+                    return_value=[
+                        NewsItem(
+                            news_id="eastmoney:600000:prepare",
+                            title="浦发银行:测试公告",
+                            summary="600000 浦发银行；公告栏目：测试",
+                            source="东方财富公告",
+                            event_time="2026-07-15 18:00:00",
+                            importance=None,
+                            tags="公告",
+                            source_file=Path("public/eastmoney_announcements/600000"),
+                        )
+                    ],
+                ) as announcements_mock,
                 redirect_stdout(output),
             ):
                 self.assertEqual(
@@ -541,6 +556,11 @@ class StorageCliTests(unittest.TestCase):
                             "2",
                             "--industry-limit",
                             "2",
+                            "--public-announcements",
+                            "--public-announcement-limit",
+                            "2",
+                            "--public-announcements-per-symbol",
+                            "1",
                             "--out-dir",
                             str(out_dir),
                         ]
@@ -567,11 +587,62 @@ class StorageCliTests(unittest.TestCase):
             with redirect_stdout(runs_output):
                 self.assertEqual(main(["--db", str(db), "daily-runs", "--limit", "1"]), 0)
 
+            announcement_failure_output = io.StringIO()
+            with (
+                patch(
+                    "ths_stock_picker.cli.fetch_tencent_observations",
+                    return_value=[
+                        observation("600000", "浦发银行", 12.0),
+                        observation("000001", "平安银行", 10.0),
+                    ],
+                ),
+                patch(
+                    "ths_stock_picker.cli.fetch_eastmoney_announcements",
+                    side_effect=RuntimeError("announcement network unavailable"),
+                ),
+                redirect_stdout(announcement_failure_output),
+            ):
+                self.assertEqual(
+                    main(
+                        [
+                            "--db",
+                            str(db),
+                            "prepare-data",
+                            "--universe",
+                            "cache",
+                            "--quote-limit",
+                            "2",
+                            "--skip-fundamentals",
+                            "--skip-industries",
+                            "--public-announcements",
+                            "--public-announcement-limit",
+                            "2",
+                            "--skip-report",
+                            "--out-dir",
+                            str(out_dir / "announcement_failure"),
+                        ]
+                    ),
+                    0,
+                )
+            repo = Repository(db)
+            try:
+                repo.init_schema()
+                announcement_failure_run = repo.daily_runs(limit=1)[0]
+                announcement_failure_summary = json.loads(announcement_failure_run["summary_json"])
+            finally:
+                repo.close()
+
         self.assertEqual(run["status"], "succeeded")
         self.assertEqual(summary["source"], "prepare_data")
         self.assertEqual(summary["public_quotes_imported"], 2)
         self.assertEqual(summary["public_fundamentals_imported"], 2)
         self.assertEqual(summary["public_industries_imported"], 2)
+        self.assertEqual(summary["public_announcement_status"], "saved")
+        self.assertEqual(summary["public_announcements_imported"], 1)
+        self.assertEqual(announcement_failure_run["status"], "succeeded")
+        self.assertEqual(announcement_failure_summary["public_announcement_status"], "failed")
+        self.assertEqual(announcement_failure_summary["public_announcements_imported"], 0)
+        self.assertIn("announcement network unavailable", announcement_failure_summary["public_announcement_error"])
         self.assertEqual(summary["data_readiness"]["status"], "ready")
         self.assertEqual(len(candidates), 2)
         self.assertEqual(fundamental_row["operating_cash_flow"], 14.0)
@@ -581,6 +652,8 @@ class StorageCliTests(unittest.TestCase):
         self.assertIn("数据准备", daily_runs_html)
         self.assertIn("数据准备充分", daily_runs_html)
         self.assertIn("报价 2", daily_runs_html)
+        self.assertIn("公告 2", daily_runs_html)
+        self.assertIn("已保存 1 条", daily_runs_html)
         self.assertIn("workflow=prepare_data", runs_output.getvalue())
         self.assertIn("readiness=ready", runs_output.getvalue())
         self.assertTrue(observations_exists)
@@ -589,7 +662,9 @@ class StorageCliTests(unittest.TestCase):
         quotes_mock.assert_called_once()
         self.assertEqual(fundamentals_mock.call_count, 2)
         self.assertEqual(industries_mock.call_count, 2)
+        announcements_mock.assert_called_once()
         self.assertIn("Saved prepare-data run", output.getvalue())
+        self.assertIn("Public announcements skipped: RuntimeError", announcement_failure_output.getvalue())
 
     def test_fundamental_health_counts_only_reports_disclosed_before_the_as_of_date(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

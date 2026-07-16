@@ -411,6 +411,9 @@ def main(argv: list[str] | None = None) -> int:
     prepare_parser.add_argument("--profile", type=Path, help="Optional JSON scoring profile.")
     prepare_parser.add_argument("--skip-fundamentals", action="store_true")
     prepare_parser.add_argument("--skip-industries", action="store_true")
+    prepare_parser.add_argument("--public-announcements", action="store_true", help="Also import public Eastmoney announcements for the prepared universe.")
+    prepare_parser.add_argument("--public-announcement-limit", type=int, default=30)
+    prepare_parser.add_argument("--public-announcements-per-symbol", type=int, default=3)
     prepare_parser.add_argument("--skip-report", action="store_true")
     universe_parser = subparsers.add_parser("universe", help="Preview symbols used for public quote fetching.")
     universe_parser.add_argument("--source", choices=["auto", "watchlist", "securities", "cache"], default="auto")
@@ -650,6 +653,9 @@ def main(argv: list[str] | None = None) -> int:
                 args.profile,
                 not args.skip_fundamentals,
                 not args.skip_industries,
+                args.public_announcements,
+                args.public_announcement_limit,
+                args.public_announcements_per_symbol,
                 not args.skip_report,
             )
         if args.command == "universe":
@@ -1485,6 +1491,9 @@ def _prepare_data(
     profile_path: Path | None,
     include_fundamentals: bool,
     include_industries: bool,
+    include_announcements: bool,
+    public_announcement_limit: int,
+    public_announcements_per_symbol: int,
     write_report: bool,
 ) -> int:
     parameters = {
@@ -1494,6 +1503,9 @@ def _prepare_data(
         "fundamental_limit": fundamental_limit if include_fundamentals else None,
         "fundamental_reports": fundamental_reports if include_fundamentals else None,
         "industry_limit": industry_limit if include_industries else None,
+        "public_announcements": include_announcements,
+        "public_announcement_limit": public_announcement_limit if include_announcements else None,
+        "public_announcements_per_symbol": public_announcements_per_symbol if include_announcements else None,
         "candidate_limit": candidate_limit,
         "report_limit": report_limit if write_report else None,
         "min_score": min_score,
@@ -1503,7 +1515,7 @@ def _prepare_data(
     run_id = repo.start_daily_run(parameters)
     summary: dict[str, object] = {"run_id": run_id, "source": "prepare_data"}
     current_step = "select_universe"
-    total_steps = 4 + int(include_fundamentals) + int(include_industries) + int(write_report)
+    total_steps = 3 + int(include_fundamentals) + int(include_industries) + int(include_announcements) + int(write_report)
     try:
         current_step = "select_universe"
         source, quote_symbols = _select_universe_symbols(repo, universe, quote_limit)
@@ -1583,6 +1595,42 @@ def _prepare_data(
             step += 1
         else:
             summary["public_industries_enabled"] = False
+
+        announcement_imported = 0
+        if include_announcements:
+            current_step = "import_public_announcements"
+            selected = quote_symbols[: max(0, public_announcement_limit)]
+            print(f"Step {step}/{total_steps}: fetching public announcements for {len(selected)} symbols")
+            try:
+                announcement_items = fetch_eastmoney_announcements(
+                    selected,
+                    per_symbol=max(1, public_announcements_per_symbol),
+                )
+                announcement_imported = repo.upsert_news_items(announcement_items)
+                summary.update(
+                    {
+                        "public_announcement_status": "saved" if announcement_imported else "empty",
+                        "public_announcement_source": source,
+                        "public_announcement_symbols": len(selected),
+                        "public_announcements_imported": announcement_imported,
+                    }
+                )
+                print(
+                    f"Imported public announcements: symbols={len(selected)} "
+                    f"items={announcement_imported}"
+                )
+            except Exception as error:
+                summary.update(
+                    {
+                        "public_announcement_status": "failed",
+                        "public_announcements_imported": 0,
+                        "public_announcement_error": f"{type(error).__name__}: {error}",
+                    }
+                )
+                print(f"Public announcements skipped: {type(error).__name__}: {error}")
+            step += 1
+        else:
+            summary["public_announcements_enabled"] = False
 
         current_step = "score"
         print(f"Step {step}/{total_steps}: scoring")

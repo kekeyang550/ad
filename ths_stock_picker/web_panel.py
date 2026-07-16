@@ -1999,10 +1999,16 @@ def _daily_run_workflow_label(summary: dict[str, object], parameters: dict[str, 
 def _daily_run_parameter_label(summary: dict[str, object], parameters: dict[str, object]) -> str:
     source = str(summary.get("source") or parameters.get("source") or "")
     if source == "prepare_data":
+        announcement_text = (
+            f"公告 {parameters.get('public_announcement_limit', '-')}"
+            if parameters.get("public_announcements")
+            else "公告未启用"
+        )
         return (
             f"报价 {parameters.get('quote_limit', '-')}，"
             f"财报 {parameters.get('fundamental_limit', '-')}，"
             f"行业 {parameters.get('industry_limit', '-')}，"
+            f"{announcement_text}，"
             f"{parameters.get('universe', '-')}"
         )
     return (
